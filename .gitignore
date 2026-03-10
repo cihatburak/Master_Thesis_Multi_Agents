@@ -1,0 +1,38 @@
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Thesis Documents & Meeting Notes
+thesis/
+*.md
+*.txt
+!requirements.txt
+
+# Databases and Big Data
+chroma_db/
+dataset_*.csv
+dataset_*.json
+csv_uploads/
+
+# Output Results and Logs
+results/
+logs/
+archive/
+general_analysis/
+generated_reports/
+evaluations_v2/
+exp_*/
+
+# OS Files
+.DS_Store
