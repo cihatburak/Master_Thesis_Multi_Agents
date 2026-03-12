@@ -31,6 +31,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 import config
+import prompts
 
 load_dotenv()
 
@@ -38,50 +39,8 @@ load_dotenv()
 # CONFIGURATION — MULTI-MODEL SETUP
 # =============================================================================
 
-# Judge models — each report is evaluated by ALL of these
-# Uses OpenRouter for access to multiple models via single API
-JUDGE_MODELS = [
-    {
-        "name": "GPT-4o",
-        "model_id": "openai/gpt-4o",
-        "provider": "openrouter",
-        "api_base": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "structured_output": True,
-    },
-    {
-        "name": "Llama-3.1-70B",
-        "model_id": "meta-llama/llama-3.1-70b-instruct",
-        "provider": "openrouter",
-        "api_base": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "structured_output": False,
-    },
-    {
-        "name": "Claude-3.5-Sonnet",
-        "model_id": "anthropic/claude-3.5-sonnet",
-        "provider": "openrouter",
-        "api_base": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "structured_output": False,
-    },
-    {
-        "name": "GPT-4o-mini",
-        "model_id": "openai/gpt-4o-mini",
-        "provider": "openrouter",
-        "api_base": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "structured_output": True,
-    },
-    {
-        "name": "Mistral-Large",
-        "model_id": "mistralai/mistral-large-2411",
-        "provider": "openrouter",
-        "api_base": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "structured_output": False,
-    },
-]
+# Judge models are now centralized in config.py
+JUDGE_MODELS = config.JUDGE_MODELS
 
 # =============================================================================
 # PYDANTIC SCHEMAS
@@ -199,190 +158,13 @@ class EvaluationResultV2:
 # Each dimension is evaluated independently with its own prompt.
 # Chain-of-thought: qualitative analysis FIRST, then score.
 
-QUALITY_DIMENSIONS = {
-    "structure": {
-        "name": "Structure",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
-
-Evaluate ONLY the STRUCTURE dimension of this report.
-
-STRUCTURE refers to:
-- Clear and logical section organization (Executive Summary, Findings, Recommendations)
-- Appropriate section headers and sub-headers
-- Logical progression and flow between sections
-- Professional markdown formatting
-- Presence of all essential report components
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: describe what you observe about the
-   report's structure, cite specific sections, explain what works and what doesn't.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Exemplary structure — all sections present, logical flow, professional formatting
-- 4: Good structure — minor organizational issues but overall well-structured
-- 3: Adequate — some structural gaps or unclear organization
-- 2: Poor — missing key sections, illogical flow
-- 1: Unacceptable — no clear structure, disorganized""",
-    },
-    "coherence": {
-        "name": "Coherence",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
-
-Evaluate ONLY the COHERENCE dimension of this report.
-
-COHERENCE refers to:
-- Logical flow between paragraphs and ideas
-- Smooth transitions between sections
-- Internal consistency (no contradictions)
-- Clear cause-and-effect reasoning
-- Each paragraph builds upon the previous one
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: describe the logical flow,
-   identify any breaks in coherence, cite specific examples of good/poor transitions.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Seamless coherence — excellent logical flow, no contradictions, clear reasoning
-- 4: Good coherence — minor flow issues but overall logically consistent
-- 3: Adequate — some logical gaps or abrupt transitions
-- 2: Poor — noticeable contradictions or confusing flow
-- 1: Incoherent — ideas jump randomly, contradictions throughout""",
-    },
-    "conciseness": {
-        "name": "Conciseness",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
-
-Evaluate ONLY the CONCISENESS dimension of this report.
-
-CONCISENESS refers to:
-- Every sentence adds value (no filler or redundancy)
-- Executive-ready brevity appropriate for decision-makers
-- No unnecessary repetition of information
-- Efficient communication of key points
-- Appropriate level of detail (not too verbose, not too sparse)
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: identify redundant passages,
-   note where the report is efficiently written, cite specific examples.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Perfectly concise — every word earns its place, executive-ready
-- 4: Good conciseness — minor redundancies but mostly efficient
-- 3: Adequate — some verbose sections that could be trimmed
-- 2: Verbose — significant redundancy, needs heavy editing
-- 1: Excessively verbose — major padding, buries key information""",
-    },
-    "professionalism": {
-        "name": "Professionalism",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
-
-Evaluate ONLY the PROFESSIONALISM dimension of this report.
-
-PROFESSIONALISM refers to:
-- Appropriate business tone and register
-- Correct grammar, spelling, and punctuation
-- Proper use of data and evidence (not anecdotal)
-- Objective language (avoids subjective or emotional language)
-- Suitable for C-suite or board-level presentation
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: assess the tone, language quality,
-   objectivity, and overall professional presentation. Cite specific examples.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Fully professional — C-suite ready, impeccable tone and language
-- 4: Professional — minor tone issues but appropriate for business use
-- 3: Acceptable — some informal language or minor errors
-- 2: Unprofessional — casual tone, noticeable errors, subjective language
-- 1: Unacceptable — inappropriate tone, major errors, unusable""",
-    },
-}
+QUALITY_DIMENSIONS = prompts.EVAL_QUALITY_DIMENSIONS
 
 # =============================================================================
 # DIMENSION-SEPARATED PROMPTS — UTILITY
 # =============================================================================
 
-UTILITY_DIMENSIONS = {
-    "actionability": {
-        "name": "Actionability",
-        "prompt": """You are a Business Strategist evaluating a BI report for practical value.
-
-Evaluate ONLY the ACTIONABILITY dimension of this report.
-
-ACTIONABILITY refers to:
-- Recommendations are specific (WHO should do WHAT by WHEN)
-- Steps are implementable with clear next actions
-- Resources or effort required are addressed
-- Recommendations are prioritized by impact
-- Feasibility of proposed actions is considered
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: examine each recommendation
-   for specificity, identify which are actionable and which are vague.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Highly actionable — specific, prioritized, implementable recommendations
-- 4: Good actionability — mostly specific with clear next steps
-- 3: Moderate — some actionable items but lacking specificity
-- 2: Weak — vague recommendations, unclear implementation path
-- 1: Not actionable — purely descriptive, no guidance for action""",
-    },
-    "root_cause_analysis": {
-        "name": "Root Cause Analysis",
-        "prompt": """You are a Business Strategist evaluating a BI report for analytical depth.
-
-Evaluate ONLY the ROOT CAUSE ANALYSIS dimension of this report.
-
-ROOT CAUSE ANALYSIS refers to:
-- Does the report explain WHY problems or patterns occur?
-- Are underlying factors identified beyond surface-level observations?
-- Is causal reasoning supported with evidence?
-- Are systemic issues distinguished from one-off incidents?
-- Does analysis go beyond "what" to explain "why" and "how"?
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: examine how deeply the report
-   investigates causes, cite specific examples of causal reasoning.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Deep root cause analysis — systemic causes identified with evidence
-- 4: Good analysis — most issues traced to underlying causes
-- 3: Moderate — some causal reasoning but largely surface-level
-- 2: Shallow — mostly describes symptoms without explaining causes
-- 1: No analysis — purely descriptive observations, no "why" answered""",
-    },
-    "strategic_depth": {
-        "name": "Strategic Depth",
-        "prompt": """You are a Business Strategist evaluating a BI report for strategic value.
-
-Evaluate ONLY the STRATEGIC DEPTH dimension of this report.
-
-STRATEGIC DEPTH refers to:
-- Findings connected to broader business context and strategy
-- Competitive positioning implications identified
-- Long-term vs. short-term impacts distinguished
-- Market trends or customer behavior patterns identified
-- Cross-functional business implications considered
-
-EVALUATION PROTOCOL:
-1. FIRST, provide a detailed qualitative analysis: assess how well the report
-   connects findings to strategic business decisions. Cite specific examples.
-2. THEN, based ONLY on your qualitative analysis, assign a score from 1–5.
-
-SCORING RUBRIC:
-- 5: Excellent strategic depth — connects to business strategy, competitive context
-- 4: Good depth — meaningful strategic implications identified
-- 3: Moderate — some strategic context but largely operational focus
-- 2: Shallow — tactical observations without strategic framing
-- 1: No strategic value — raw data or observations only""",
-    },
-}
+UTILITY_DIMENSIONS = prompts.EVAL_UTILITY_DIMENSIONS
 
 
 # =============================================================================

@@ -6,14 +6,10 @@ Implements a Manager/Worker topology where a Manager coordinates
 workers and can LOOP BACK to previous agents if output quality
 is insufficient.
 
-This is the TREATMENT condition — the only difference from the Flat
-(control) group is the PRESENCE of a Manager node that can:
-  1. Review each worker's output
-  2. Decide to proceed forward OR loop back to a previous worker
-  3. Provide corrective instructions when looping back
-
-4 Agents: Researcher, Analyst, Writer, Critic (IDENTICAL to Flat)
-Coordination: Manager node with loop-back authority
+This is the TREATMENT condition — it tests Asymmetric Influence.
+Workers read and write to the Shared Blackboard, but the Manager
+has the authority to review the Blackboard and force agents to revise
+their work, creating a hierarchical power dynamic.
 """
 
 import os
@@ -29,6 +25,7 @@ from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+import prompts
 from tools import get_product_specs, search_reviews, verify_claim
 from logger import save_logs
 import config
@@ -38,16 +35,17 @@ load_dotenv()
 
 
 # =============================================================================
-# STATE DEFINITION
+# STATE DEFINITION (The Shared Blackboard + Routing State)
 # =============================================================================
 
 class AgentState(TypedDict):
     """State shared across all agents in the hierarchical architecture."""
     messages: Annotated[list[BaseMessage], add_messages]
-    next: str
-    instructions: str
-    step_count: int
-    loop_count: int
+    blackboard: str  # The shared workspace
+    next: str        # The next agent to route to, determined by Manager
+    instructions: str # Manager's specific instructions for the next agent
+    step_count: int  # Total graph steps
+    loop_count: int  # Number of times Manager forced a loop-back
 
 
 # =============================================================================
@@ -63,152 +61,105 @@ llm = ChatOpenAI(
 
 
 # =============================================================================
-# WORKER PROMPTS (IDENTICAL to Flat Architecture)
-# =============================================================================
-
-RESEARCHER_PROMPT = """You are a Research Analyst specializing in e-commerce product data.
-Your role is to gather factual information about products and customer reviews.
-
-When given a task:
-1. Use get_product_specs to retrieve product details
-2. Use search_reviews to find relevant customer feedback
-3. Provide raw data and findings WITHOUT interpretation
-
-Be thorough but concise. Present facts clearly with specific quotes and numbers."""
-
-ANALYST_PROMPT = """You are a Business Intelligence Analyst.
-Your role is to analyze data provided by the Researcher and extract actionable insights.
-
-When given research data:
-1. Summarize the RATING DISTRIBUTION (e.g., "8 positive, 4 negative, 3 mixed out of 15 reviews")
-2. Categorize findings into themes: Performance, Build Quality, Value for Money, 
-   Battery Life, Display, Customer Service, etc.
-3. For each negative theme, perform ROOT CAUSE ANALYSIS:
-   - WHAT is the issue? (symptom)
-   - WHY does it occur? (underlying cause if identifiable)
-   - HOW MANY customers mention it? (frequency)
-   - WHAT IS THE BUSINESS IMPACT? (returns, brand damage, competitive disadvantage)
-4. Identify COMPETITIVE CONTEXT where possible (comparisons customers make)
-5. Distinguish SYSTEMIC issues (design/manufacturing) from ONE-OFF incidents (shipping damage)
-
-Do NOT make up data. Only analyze what has been provided in the conversation.
-Always cite specific review quotes as evidence for your claims."""
-
-WRITER_PROMPT = """You are a BI Report Writer.
-Your role is to compile findings into a professional Business Intelligence report.
-
-REPORT STRUCTURE (use these exact sections):
-1. **Executive Summary** — 2-3 sentence overview of key findings
-2. **Product Overview & Technical Specifications** — Include key specs from research:
-   CPU, GPU, RAM, Storage, Display (size, resolution, refresh rate), Price.
-   Present as a clear specifications table or list.
-3. **Customer Feedback Analysis** — Categorized findings with evidence
-   Include the overall rating distribution (e.g., "60% positive, 25% negative")
-4. **Key Issues & Root Causes** — Top problems with underlying causes
-5. **Actionable Recommendations** — Each recommendation MUST follow this format:
-   - WHO should act (e.g., "Product team", "Marketing", "Customer support")
-   - WHAT specifically to do (concrete action, not vague suggestion)
-   - WHEN / PRIORITY (immediate, short-term, long-term)
-   - EXPECTED IMPACT (what improvement this would bring)
-6. **Conclusion** — Strategic summary for decision-makers
-
-CRITICAL RULES:
-- ALWAYS include the product's technical specifications in Section 2
-- ALWAYS cite specific customer quotes as evidence
-- Recommendations must be SPECIFIC and ACTIONABLE, not generic
-- Format the report in Markdown for readability"""
-
-CRITIC_PROMPT = """You are a Quality Control Analyst.
-Your role is to review the Writer's report for accuracy and completeness.
-
-When reviewing:
-1. Check if claims are supported by evidence from the research
-2. Identify any unsupported statements or potential hallucinations
-3. Verify that recommendations are actionable and specific
-4. Assess overall report quality and professionalism
-
-Use verify_claim tool to check specific claims against the database.
-Provide specific feedback on what needs improvement.
-
-If the report is satisfactory, confirm with "APPROVED: [brief summary of quality]".
-If issues found, list them clearly for the record."""
-
-
-# =============================================================================
-# WORKER AGENT DEFINITIONS (IDENTICAL to Flat Architecture)
+# AGENT INITIALIZATION
 # =============================================================================
 
 researcher_agent = create_react_agent(
     llm,
     tools=[get_product_specs, search_reviews],
-    prompt=RESEARCHER_PROMPT
+    prompt=prompts.RESEARCHER_PROMPT
 )
 
 analyst_agent = create_react_agent(
     llm,
-    tools=[],  # Analyst works with data already in conversation
-    prompt=ANALYST_PROMPT
+    tools=[], 
+    prompt=prompts.ANALYST_PROMPT
 )
 
 writer_agent = create_react_agent(
     llm,
-    tools=[],  # Writer works with analysis already in conversation
-    prompt=WRITER_PROMPT
+    tools=[], 
+    prompt=prompts.WRITER_PROMPT
 )
 
 critic_agent = create_react_agent(
     llm,
-    tools=[verify_claim],  # Critic can verify claims against DB
-    prompt=CRITIC_PROMPT
+    tools=[verify_claim], 
+    prompt=prompts.CRITIC_PROMPT
 )
 
 
 # =============================================================================
-# WORKER NODE WRAPPERS
+# WORKER NODE WRAPPERS (Blackboard Interaction Logic)
 # =============================================================================
+
+def _get_last_ai_message(messages: list[BaseMessage]) -> str:
+    """Extract the last string response given by the AI agent."""
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content.strip():
+            return message.content
+    return ""
+
 
 def researcher_node(state: AgentState) -> dict:
     """Execute the Researcher worker."""
-    messages = state["messages"]
-    if state.get("instructions"):
-        messages = messages + [
-            HumanMessage(content=f"[Manager Feedback]: {state['instructions']}")
-        ]
-    result = researcher_agent.invoke({"messages": messages})
-    return {"messages": result["messages"]}
+    input_text = f"User Request: {state['messages'][0].content}\n\nCurrent Blackboard:\n{state.get('blackboard', '')}"
+    
+    # Manager can pass specific instructions/corrections
+    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+        input_text += f"\n\n[MANAGER FEEDBACK / LOOP-BACK INSTRUCTIONS]:\n{state['instructions']}"
+        
+    result = researcher_agent.invoke({"messages": [HumanMessage(content=input_text)]})
+    new_insight = _get_last_ai_message(result["messages"])
+    
+    updated_blackboard = state.get("blackboard", "") + f"\n\n--- RESEARCHER FINDINGS ---\n{new_insight}"
+    
+    return {"messages": result["messages"], "blackboard": updated_blackboard}
 
 
 def analyst_node(state: AgentState) -> dict:
     """Execute the Analyst worker."""
-    messages = state["messages"]
-    if state.get("instructions"):
-        messages = messages + [
-            HumanMessage(content=f"[Manager Feedback]: {state['instructions']}")
-        ]
-    result = analyst_agent.invoke({"messages": messages})
-    return {"messages": result["messages"]}
+    input_text = f"Here is the current Shared Blackboard. Analyze the research:\n{state.get('blackboard', '')}"
+    
+    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+        input_text += f"\n\n[MANAGER FEEDBACK / LOOP-BACK INSTRUCTIONS]:\n{state['instructions']}"
+        
+    result = analyst_agent.invoke({"messages": [HumanMessage(content=input_text)]})
+    new_insight = _get_last_ai_message(result["messages"])
+    
+    updated_blackboard = state.get("blackboard", "") + f"\n\n--- ANALYST INSIGHTS ---\n{new_insight}"
+    
+    return {"messages": result["messages"], "blackboard": updated_blackboard}
 
 
 def writer_node(state: AgentState) -> dict:
     """Execute the Writer worker."""
-    messages = state["messages"]
-    if state.get("instructions"):
-        messages = messages + [
-            HumanMessage(content=f"[Manager Feedback]: {state['instructions']}")
-        ]
-    result = writer_agent.invoke({"messages": messages})
-    return {"messages": result["messages"]}
+    input_text = f"Here is the current Shared Blackboard. Write the BI Report based on this:\n{state.get('blackboard', '')}"
+    
+    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+        input_text += f"\n\n[MANAGER FEEDBACK / LOOP-BACK INSTRUCTIONS]:\n{state['instructions']}"
+        
+    result = writer_agent.invoke({"messages": [HumanMessage(content=input_text)]})
+    new_insight = _get_last_ai_message(result["messages"])
+    
+    updated_blackboard = state.get("blackboard", "") + f"\n\n--- DRAFT REPORT (WRITER) ---\n{new_insight}"
+    
+    return {"messages": result["messages"], "blackboard": updated_blackboard}
 
 
 def critic_node(state: AgentState) -> dict:
     """Execute the Critic worker."""
-    messages = state["messages"]
-    if state.get("instructions"):
-        messages = messages + [
-            HumanMessage(content=f"[Manager Feedback]: {state['instructions']}")
-        ]
-    result = critic_agent.invoke({"messages": messages})
-    return {"messages": result["messages"]}
+    input_text = f"Here is the current Shared Blackboard. Review the Draft Report and verify findings:\n{state.get('blackboard', '')}"
+    
+    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+        input_text += f"\n\n[MANAGER FEEDBACK / LOOP-BACK INSTRUCTIONS]:\n{state['instructions']}"
+        
+    result = critic_agent.invoke({"messages": [HumanMessage(content=input_text)]})
+    new_insight = _get_last_ai_message(result["messages"])
+    
+    updated_blackboard = state.get("blackboard", "") + f"\n\n--- CRITIC REVIEW ---\n{new_insight}"
+    
+    return {"messages": result["messages"], "blackboard": updated_blackboard}
 
 
 # =============================================================================
@@ -222,46 +173,19 @@ class ManagerDecision(BaseModel):
     reasoning: str = Field(description="Brief reasoning for this decision")
 
 
-MANAGER_PROMPT = """You coordinate a BI report generation team of 4 workers:
-- Researcher: Gathers product specs and customer reviews from the database
-- Analyst: Analyzes gathered data to find patterns and insights
-- Writer: Compiles research into a professional BI report
-- Critic: Reviews the report for accuracy and quality
-
-WORKFLOW:
-The standard sequence is: Researcher → Analyst → Writer → Critic → FINISH.
-After each worker completes their task, you review the output and decide:
-
-1. PROCEED to the next worker in sequence (if output is sufficient), OR
-2. LOOP BACK to a previous worker (if output needs improvement)
-
-LOOP-BACK RULES:
-- You may loop back at most {max_loops} times total across the entire workflow
-- Current loop count: {loop_count} / {max_loops}
-- When looping back, provide SPECIFIC instructions on what needs improvement
-- If max loops reached, always proceed forward
-
-DECISION GUIDE:
-- After Researcher: Does the data include product specs AND customer reviews with quotes?
-- After Analyst: Are themes identified with evidence? Is root cause analysis present?
-- After Writer: Does the report follow the required 6-section structure?
-- After Critic: Has the Critic verified claims? Choose FINISH.
-
-Current step: {step_count}
-Analyze the conversation and decide the next step."""
-
 MAX_LOOPS = 1  # Maximum loop-backs allowed (kept minimal to reduce context pollution)
 
 
 def manager_node(state: AgentState) -> dict:
     """
-    Manager node — reviews worker output and decides next step.
+    Manager node — reviews worker output on the Blackboard and decides next step.
     
     This is the ONLY component that differs from the Flat architecture.
-    The Manager can loop back to previous workers if needed.
+    The Manager can loop back to previous workers if needed based on authority.
     """
     step_count = state.get("step_count", 0) + 1
     loop_count = state.get("loop_count", 0)
+    blackboard = state.get("blackboard", "")
 
     # Safety: force finish after too many steps
     if step_count > config.HIERARCHICAL_MAX_STEPS:
@@ -271,21 +195,21 @@ def manager_node(state: AgentState) -> dict:
             "step_count": step_count,
         }
 
-    # Check if Critic already approved
-    for msg in reversed(state["messages"]):
-        if hasattr(msg, "content") and isinstance(msg, AIMessage):
-            if "APPROVED:" in msg.content:
-                return {
-                    "next": "FINISH",
-                    "instructions": "Report approved by Critic.",
-                    "step_count": step_count,
-                }
-            break  # Only check last AI message
+    # Check if Critic already approved in the Blackboard
+    if "APPROVED:" in blackboard and "--- CRITIC REVIEW ---" in blackboard:
+        # Get purely the Critic's section to ensure they are the one who approved it
+        critic_section = blackboard.split("--- CRITIC REVIEW ---")[-1]
+        if "APPROVED:" in critic_section:
+            return {
+                "next": "FINISH",
+                "instructions": "Report approved by Critic.",
+                "step_count": step_count,
+            }
 
-    # Manager makes a routing decision
+    # Manager makes a routing decision based on the Blackboard
     manager_llm = llm.with_structured_output(ManagerDecision)
 
-    formatted_prompt = MANAGER_PROMPT.format(
+    formatted_prompt = prompts.MANAGER_PROMPT.format(
         step_count=step_count,
         loop_count=loop_count,
         max_loops=MAX_LOOPS,
@@ -293,38 +217,34 @@ def manager_node(state: AgentState) -> dict:
 
     messages = [
         SystemMessage(content=formatted_prompt),
-        *state["messages"],
         HumanMessage(
-            content=f"Step {step_count}. Review the latest output and decide: "
+            content=f"Step {step_count}. Review the latest Shared Blackboard and decide: "
                     f"proceed to next worker or loop back? "
-                    f"(Loops used: {loop_count}/{MAX_LOOPS})"
+                    f"(Loops used: {loop_count}/{MAX_LOOPS})\n\n"
+                    f"CURRENT BLACKBOARD:\n{blackboard}"
         ),
     ]
 
     result = manager_llm.invoke(messages)
 
-    # Track if this is a loop-back (going to a worker that already spoke)
-    workers_in_order = ["Researcher", "Analyst", "Writer", "Critic"]
-    # Determine which workers have already contributed
+    # Determine which workers have already contributed via Blackboard tags
     workers_done = set()
-    for msg in state["messages"]:
-        if hasattr(msg, "content") and isinstance(msg, AIMessage):
-            content = msg.content
-            # Heuristic: detect which worker produced this message
-            if any(s in content for s in ["product specifications", "ASIN", "search_reviews"]):
-                workers_done.add("Researcher")
-            elif any(s in content for s in ["ROOT CAUSE", "rating distribution", "systemic"]):
-                workers_done.add("Analyst")
-            elif any(s in content for s in ["Executive Summary", "## ", "Actionable Recommendations"]):
-                workers_done.add("Writer")
-            elif any(s in content for s in ["APPROVED", "verify_claim", "Quality Control"]):
-                workers_done.add("Critic")
+    if "--- RESEARCHER FINDINGS ---" in blackboard:
+        workers_done.add("Researcher")
+    if "--- ANALYST INSIGHTS ---" in blackboard:
+        workers_done.add("Analyst")
+    if "--- DRAFT REPORT (WRITER) ---" in blackboard:
+        workers_done.add("Writer")
+    if "--- CRITIC REVIEW ---" in blackboard:
+        workers_done.add("Critic")
 
     new_loop_count = loop_count
+    # A loop-back occurs if Manager selects a worker that already went, and it's not FINISH
     if result.next_worker in workers_done and result.next_worker != "FINISH":
         new_loop_count = loop_count + 1
-        # If we've exceeded max loops, override to move forward
+        # If we've exceeded max loops, override to move forward robustly
         if new_loop_count > MAX_LOOPS:
+            workers_in_order = ["Researcher", "Analyst", "Writer", "Critic"]
             # Find next worker in sequence that hasn't been done
             for w in workers_in_order:
                 if w not in workers_done:
@@ -334,6 +254,10 @@ def manager_node(state: AgentState) -> dict:
             else:
                 result.next_worker = "FINISH"
                 result.instructions = "All workers complete, finishing."
+
+    # Provide default instructions if proceeding naturally so we don't pollute context
+    if result.next_worker not in workers_done and result.next_worker != "FINISH":
+        result.instructions = "Proceeding forward."
 
     return {
         "next": result.next_worker,
@@ -394,7 +318,7 @@ def build_hierarchical_graph() -> StateGraph:
         },
     )
 
-    # All workers report back to Manager
+    # All workers report back to Manager once they append to the Blackboard
     workflow.add_edge("Researcher", "Manager")
     workflow.add_edge("Analyst", "Manager")
     workflow.add_edge("Writer", "Manager")
@@ -413,6 +337,7 @@ def run_hierarchical_graph(query: str, session_id: str = "session") -> tuple[str
 
     initial_state = {
         "messages": [HumanMessage(content=query)],
+        "blackboard": f"Initial Request: {query}",
         "next": "",
         "instructions": "",
         "step_count": 0,
@@ -440,30 +365,27 @@ def run_hierarchical_graph(query: str, session_id: str = "session") -> tuple[str
     save_logs(
         session_id, "hierarchical",
         final_state["messages"],
-        {"query": query, "metrics": metrics},
+        {
+            "query": query, 
+            "metrics": metrics,
+            "final_blackboard": final_state.get("blackboard", "")
+        },
     )
 
-    # Extract the Writer's report (NOT the Critic's review)
-    for message in reversed(final_state["messages"]):
-        if hasattr(message, "content") and isinstance(message, AIMessage):
-            content = message.content
-            # Skip non-report messages
-            if "APPROVED" in content:
-                continue
-            if "[Manager" in content:
-                continue
-            if content.strip().startswith("### Review"):
-                continue
-            # Look for actual BI report (has markdown headers + BI sections)
-            if "##" in content or "# " in content:
-                if any(s in content for s in [
-                    "Executive Summary", "Findings",
-                    "Recommendations", "Summary", "Analysis",
-                ]):
-                    return content, final_state["messages"], metrics
+    # Extract the Writer's report from the Blackboard
+    report = ""
+    blackboard_content = final_state.get("blackboard", "")
+    
+    if "--- DRAFT REPORT (WRITER) ---" in blackboard_content:
+        parts = blackboard_content.split("--- DRAFT REPORT (WRITER) ---")
+        writer_part = parts[-1]  # Take the last one in case of loop-backs
+        report = writer_part.split("--- CRITIC REVIEW ---")[0].strip()
 
-    # Fallback to last message
-    return final_state["messages"][-1].content, final_state["messages"], metrics
+    # Fallback if parsing fails
+    if not report:
+        report = _get_last_ai_message(final_state["messages"])
+
+    return report, final_state["messages"], metrics
 
 
 # =============================================================================
@@ -472,8 +394,8 @@ def run_hierarchical_graph(query: str, session_id: str = "session") -> tuple[str
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("HIERARCHICAL AGENT ARCHITECTURE — Manager with Loop-back")
-    print("Manager → Researcher → Analyst → Writer → Critic (+ loop-backs)")
+    print("HIERARCHICAL AGENT ARCHITECTURE — Manager with Loop-Back Authority")
+    print("Manager evaluates Blackboard and coordinates: R → A → W → C → END")
     print("=" * 70)
 
     query = "Analyze the MSI Katana (B0CXVGSY2H) focusing on customer feedback."
@@ -485,9 +407,9 @@ if __name__ == "__main__":
     result, messages, metrics = run_hierarchical_graph(query)
 
     print("\n" + "=" * 70)
-    print("FINAL REPORT:")
+    print("FINAL EXTRACTED REPORT:")
     print("=" * 70)
-    print(result)
+    print(result[:1500] + "\n\n...[TRUNCATED]...")
 
     print("\n" + "=" * 70)
     print("EFFICIENCY METRICS:")

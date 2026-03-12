@@ -6,9 +6,9 @@ Runs Flat and Hierarchical architectures across N products,
 evaluates each report with evaluate_v2, and generates thesis-ready summary tables.
 
 Experimental Design:
-  - Control (Flat): Deterministic pipeline R → A → W → C → END
-  - Treatment (Hierarchical): Same workers + Manager with loop-back authority
-  - Treatment variable: Manager's loop-back capability (only difference)
+  - Control (Flat): Manager-interleaved pipeline, Manager has NO loop-back authority
+  - Treatment (Hierarchical): Same workers + Manager WITH loop-back authority
+  - Treatment variable: Manager's loop-back authority (only difference)
 
 Usage:
     python run_experiment.py                      # 15 random products
@@ -35,7 +35,7 @@ load_dotenv()
 # Local imports
 from flat_graph import run_flat_graph
 from hierarchical_graph import run_hierarchical_graph
-from evaluate_v2 import evaluate_report_v2, JUDGE_MODELS
+from evaluate import evaluate_report_v2, JUDGE_MODELS
 from efficiency_tracker import EfficiencyTracker
 from config import calculate_cost, MODEL_NAME
 from tools import get_product_specs
@@ -59,11 +59,11 @@ def _find_model(name):
     return None
 
 EXPERIMENT_MODELS = [m for m in [
-    _find_model("GPT-4o"),
-    _find_model("Llama-3.1-70B"),
-    _find_model("Claude-3.5-Sonnet"),
-    _find_model("GPT-4o-mini"),
-    _find_model("Mistral-Large"),
+    _find_model("GPT-5.4"),
+    _find_model("Gemini-3.1-Pro"),
+    _find_model("Qwen-3.5-122B"),
+    _find_model("GLM-5"),
+    _find_model("Mistral-Small"),
 ] if m is not None]
 
 # Architectures: Flat (control) vs. Hierarchical (treatment)
@@ -72,8 +72,8 @@ ARCHITECTURES = [
     "hierarchical",
 ]
 
-# Delay between API calls (seconds)
-API_DELAY = 2
+# Delay between API calls (seconds) - Set to 0 for maximum speed with 2026 models
+API_DELAY = 0
 
 
 # =============================================================================
@@ -175,14 +175,15 @@ def run_single(
         gen_metrics.completion_tokens,
     )
 
-    # Estimate evaluation cost (approximate: each judge call uses ~2K tokens)
+    # Estimate evaluation cost based on empirical data from pilot run
+    # True evaluation cost was ~2.8x higher than initial formula due to lengthy CoT outputs and large prompts
     n_judges = len(models)
     n_dimensions = 7  # 4 quality + 3 utility
-    eval_tokens_est = evaluation.total_eval_tokens if evaluation.total_eval_tokens > 0 else n_judges * n_dimensions * 2000
-    eval_cost = sum(
-        calculate_cost(m["model_id"], eval_tokens_est // (n_judges * 2), eval_tokens_est // (n_judges * 2))
-        for m in models
-    )
+    eval_cost = 0.0
+    for m in models:
+        prompt_t = n_dimensions * 3200
+        completion_t = n_dimensions * 500
+        eval_cost += calculate_cost(m["model_id"], prompt_t, completion_t)
 
     total_cost = round(gen_cost + eval_cost, 6)
 
@@ -257,7 +258,7 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
     # ── Table 2: Per-Dimension Scores ──
     md += "\n---\n\n## Table 2: Per-Dimension Mean Scores\n\n"
     all_dims = [
-        "structure", "coherence", "conciseness", "professionalism",
+        "structure", "coherence", "conciseness",
         "actionability", "root_cause_analysis", "strategic_depth",
     ]
     md += "| Dimension | " + " | ".join(a.title() for a in ARCHITECTURES) + " |\n"

@@ -12,10 +12,9 @@ from datetime import datetime
 import plotly.graph_objects as go
 import streamlit as st
 
-from evaluate_v2 import evaluate_report_v2, JUDGE_MODELS
+from evaluate import evaluate_report_v2, JUDGE_MODELS
 from flat_graph import run_flat_graph
 from hierarchical_graph import run_hierarchical_graph
-from baseline_graph import run_baseline
 from efficiency_tracker import EfficiencyTracker
 from tools import get_product_list, get_product_specs
 from logger import format_messages_for_display
@@ -143,17 +142,15 @@ with st.sidebar:
     st.subheader("🏗️ Agent Architecture")
     architecture = st.radio(
         "Select team structure:",
-        options=["Baseline (Zero-Shot)", "Flat Team", "Hierarchical Team"],
-        help="Baseline: Single GPT-4 call. Flat: Peer agents with router. Hierarchical: Manager supervises workers."
+        options=["Flat Team", "Hierarchical Team"],
+        help="Flat: Peer agents with router. Hierarchical: Manager supervises workers."
     )
 
     # Architecture description
-    if architecture == "Baseline (Zero-Shot)":
-        st.warning("**Baseline**: Single GPT-4 call with raw data (no agents, no coordination)")
-    elif architecture == "Flat Team":
-        st.info("**Flat Team**: Router → Researcher → Analyst → Writer (peer-level coordination)")
+    if architecture == "Flat Team":
+        st.info("**Flat Team**: Manager (peer) → R → A → W → C (symmetric influence, no loop-back)")
     else:
-        st.success("**Hierarchical Team**: Manager supervises Researcher & Writer with Socratic method and hallucination detection")
+        st.success("**Hierarchical Team**: Manager supervises Workers with loop-back authority (asymmetric influence)")
 
     st.markdown("---")
 
@@ -225,31 +222,17 @@ if generate_btn:
         # Initialize
         metrics = None
         agent_messages = None
-        arch_key = "baseline" if architecture == "Baseline (Zero-Shot)" else (
-            "flat" if architecture == "Flat Team" else "hierarchical"
-        )
+        arch_key = "flat" if architecture == "Flat Team" else "hierarchical"
 
         # Start efficiency tracking
         tracker = EfficiencyTracker(arch_key, asin=selected_asin, model="gpt-4o")
         tracker.start()
 
         # Phase 1: Report Generation
-        if architecture == "Baseline (Zero-Shot)":
-            st.write("📝 **Baseline Architecture Selected**")
-            st.write("🔄 Fetching product data from database...")
-            st.write("✨ Generating report with single GPT-4 call...")
-
-            try:
-                report, metrics = run_baseline(query, selected_asin, session_id=selected_asin)
-                agent_messages = []
-                st.write("✅ Report generated successfully!")
-            except Exception as e:
-                st.error(f"Error generating report: {e}")
-                st.stop()
-        elif architecture == "Flat Team":
+        if architecture == "Flat Team":
             st.write("📊 **Flat Architecture Selected**")
-            st.write("🔄 Router is coordinating the team...")
-            st.write("🔍 Researcher → 📈 Analyst → ✍️ Writer → 🔬 Critic")
+            st.write("🔄 Manager (peer) is coordinating the team...")
+            st.write("👔 Manager → 🔍 Researcher → 👔 Manager → 📈 Analyst → 👔 Manager → ✍️ Writer → 👔 Manager → 🔬 Critic → 👔 Manager → END")
 
             try:
                 report, agent_messages, metrics = run_flat_graph(query, session_id=selected_asin)
@@ -278,7 +261,7 @@ if generate_btn:
         st.write("---")
         st.write(f"⚖️ **Evaluating with {len(selected_models)} model(s): "
                  f"{', '.join(m['name'] for m in selected_models)}**")
-        st.write("📊 Quality: Structure, Coherence, Conciseness, Professionalism")
+        st.write("📊 Quality: Structure, Coherence, Conciseness")
         st.write("🚀 Utility: Actionability, Root Cause, Strategic Depth")
         st.write("🎯 Accuracy: Ground Truth Spec Verification")
 
@@ -426,9 +409,7 @@ if generate_btn:
             st.markdown("---")
             st.markdown("#### 📥 Export Results")
 
-            arch_name = "Baseline" if architecture == "Baseline (Zero-Shot)" else (
-                "Flat" if architecture == "Flat Team" else "Hierarchical"
-            )
+            arch_name = "Flat" if architecture == "Flat Team" else "Hierarchical"
 
             # Build per-model breakdown table
             per_model_rows = ""
@@ -615,33 +596,24 @@ else:
     # Show architecture comparison
     st.subheader("🔍 Architecture Comparison")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("#### ⚡ Baseline (Zero-Shot)")
+        st.markdown("#### 🔄 Flat Architecture")
         st.markdown("""
-        - **Structure**: Single LLM call
-        - **Coordination**: None
-        - **Purpose**: True zero-shot control
-        - **Cost**: Lowest
+        - **Structure**: 5 agents (4 Workers + Manager as peer)
+        - **Coordination**: Symmetric influence
+        - **Workflow**: Manager → R → Manager → A → Manager → W → Manager → C → END
+        - **Manager Authority**: None (commentary only)
         """)
 
     with col2:
-        st.markdown("#### 🔄 Flat Architecture")
-        st.markdown("""
-        - **Structure**: Peer-level agents
-        - **Coordination**: LLM Router
-        - **Workflow**: Router → R → A → W → C
-        - **Cost**: Medium
-        """)
-
-    with col3:
         st.markdown("#### 🏗️ Hierarchical Architecture")
         st.markdown("""
-        - **Structure**: Manager + Workers
-        - **Coordination**: Socratic method
-        - **Workflow**: Manager → Workers → Reflexion
-        - **Cost**: Highest (but most accurate)
+        - **Structure**: 5 agents (4 Workers + Manager as supervisor)
+        - **Coordination**: Asymmetric influence
+        - **Workflow**: Manager → Workers (with loop-back)
+        - **Manager Authority**: Can reject and force loop-back
         """)
 
     st.markdown("---")
@@ -660,8 +632,8 @@ else:
 
     ev_col1, ev_col2, ev_col3 = st.columns(3)
     with ev_col1:
-        st.markdown("**📊 Quality (4 dims)**")
-        st.markdown("- Structure\n- Coherence\n- Conciseness\n- Professionalism")
+        st.markdown("**📊 Quality (3 dims)**")
+        st.markdown("- Structure\n- Coherence\n- Conciseness")
     with ev_col2:
         st.markdown("**🚀 Utility (3 dims)**")
         st.markdown("- Actionability\n- Root Cause Analysis\n- Strategic Depth")
