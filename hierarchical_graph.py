@@ -173,7 +173,7 @@ class ManagerDecision(BaseModel):
     reasoning: str = Field(description="Brief reasoning for this decision")
 
 
-MAX_LOOPS = 1  # Maximum loop-backs allowed (kept minimal to reduce context pollution)
+MAX_LOOPS = 2  # Maximum loop-backs allowed (increased from 1 based on pilot)
 
 
 def manager_node(state: AgentState) -> dict:

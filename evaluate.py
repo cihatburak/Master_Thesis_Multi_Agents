@@ -335,7 +335,7 @@ def _get_llm_client(model_config: dict) -> ChatOpenAI:
     kwargs = {
         "model": model_config["model_id"],
         "temperature": 0,
-        "request_timeout": 60,
+        "request_timeout": 120,  # Increased from 60 to handle slow judge models (Qwen/GLM)
     }
 
     if model_config["provider"] == "openrouter":
@@ -414,64 +414,77 @@ Remember: analyze first, score second. Your score must be justified by your anal
         HumanMessage(content=user_content),
     ]
 
-    try:
-        llm = _get_llm_client(model_config)
-        use_structured = model_config.get("structured_output", True)
+    max_retries = 3
+    retry_delay = 2
 
-        if use_structured:
-            # ── Path A: Structured output (native support) ──
-            try:
-                judge_llm = llm.with_structured_output(DimensionJudgment)
-                result = judge_llm.invoke(messages)
-                latency = time.time() - start_time
+    for attempt in range(max_retries):
+        try:
+            llm = _get_llm_client(model_config)
+            use_structured = model_config.get("structured_output", True)
 
-                return DimensionResult(
-                    dimension=dimension_key,
-                    model_name=model_config["name"],
-                    qualitative_analysis=result.qualitative_analysis,
-                    score=result.score,
-                    latency_seconds=round(latency, 2),
-                )
+            if use_structured:
+                # ── Path A: Structured output (native support) ──
+                try:
+                    judge_llm = llm.with_structured_output(DimensionJudgment)
+                    result = judge_llm.invoke(messages)
+                    latency = time.time() - start_time
 
-            except Exception as structured_err:
-                print(f"   ↩️  {model_config['name']}: structured output failed, using JSON fallback")
-                # Fall through to JSON mode below
+                    return DimensionResult(
+                        dimension=dimension_key,
+                        model_name=model_config["name"],
+                        qualitative_analysis=result.qualitative_analysis,
+                        score=result.score,
+                        latency_seconds=round(latency, 2),
+                    )
 
-        # ── Path B: JSON-mode (direct or fallback) ──
-        json_instruction = (
-            "\n\nRESPOND ONLY with a JSON object in this exact format:\n"
-            '{"qualitative_analysis": "<your detailed analysis>", "score": <number 1.0-5.0>}'
-        )
-        fallback_messages = [
-            SystemMessage(content=dimension_config["prompt"]),
-            HumanMessage(content=user_content + json_instruction),
-        ]
+                except Exception as structured_err:
+                    # If structured failed, fall back to JSON but check if it's a timeout
+                    if "timeout" in str(structured_err).lower() and attempt < max_retries - 1:
+                        raise structured_err # Trigger retry
+                    
+                    print(f"   ↩️  {model_config['name']}: structured output failed, using JSON fallback")
+                    # Fall through to JSON mode below
 
-        response = llm.invoke(fallback_messages)
-        parsed = _parse_json_fallback(response.content)
-        latency = time.time() - start_time
+            # ── Path B: JSON-mode (direct or fallback) ──
+            json_instruction = (
+                "\n\nRESPOND ONLY with a JSON object in this exact format:\n"
+                '{"qualitative_analysis": "<your detailed analysis>", "score": <number 1.0-5.0>}'
+            )
+            fallback_messages = [
+                SystemMessage(content=dimension_config["prompt"]),
+                HumanMessage(content=user_content + json_instruction),
+            ]
 
-        score = float(parsed.get("score", 3.0))
-        score = max(1.0, min(5.0, score))  # clamp to valid range
+            response = llm.invoke(fallback_messages)
+            parsed = _parse_json_fallback(response.content)
+            latency = time.time() - start_time
 
-        return DimensionResult(
-            dimension=dimension_key,
-            model_name=model_config["name"],
-            qualitative_analysis=parsed.get("qualitative_analysis", "Fallback parse"),
-            score=score,
-            latency_seconds=round(latency, 2),
-        )
+            score = float(parsed.get("score", 3.0))
+            score = max(1.0, min(5.0, score))  # clamp to valid range
 
-    except Exception as e:
-        latency = time.time() - start_time
-        print(f"   ⚠️  Error evaluating {dimension_config['name']} with {model_config['name']}: {e}")
-        return DimensionResult(
-            dimension=dimension_key,
-            model_name=model_config["name"],
-            qualitative_analysis=f"ERROR: {str(e)}",
-            score=3.0,  # neutral fallback
-            latency_seconds=round(latency, 2),
-        )
+            return DimensionResult(
+                dimension=dimension_key,
+                model_name=model_config["name"],
+                qualitative_analysis=parsed.get("qualitative_analysis", "Fallback parse"),
+                score=score,
+                latency_seconds=round(latency, 2),
+            )
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"   🔄  Retry {attempt+1}/{max_retries} for {dimension_key}/{model_config['name']} due to: {str(e)[:50]}...")
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            
+            latency = time.time() - start_time
+            print(f"   ⚠️  Final Error evaluating {dimension_config['name']} with {model_config['name']}: {e}")
+            return DimensionResult(
+                dimension=dimension_key,
+                model_name=model_config["name"],
+                qualitative_analysis=f"ERROR: {str(e)}",
+                score=3.0,  # neutral fallback
+                latency_seconds=round(latency, 2),
+            )
 
 
 # =============================================================================

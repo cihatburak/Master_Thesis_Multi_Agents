@@ -41,7 +41,7 @@ RECURSION_LIMIT = 100
 FLAT_MAX_STEPS = 9
 
 # Hierarchical graph: 4 workers + Manager decisions + up to 2 loop-backs
-HIERARCHICAL_MAX_STEPS = 10
+HIERARCHICAL_MAX_STEPS = 15
 
 # =============================================================================
 # EVALUATION SETTINGS
@@ -51,7 +51,7 @@ HIERARCHICAL_MAX_STEPS = 10
 EVAL_MAX_WORKERS = 20
 
 # Timeout for each judge evaluation (seconds)
-EVAL_TIMEOUT = 90
+EVAL_TIMEOUT = 180
 
 # =============================================================================
 # EVALUATION v2 SETTINGS (Multi-Model)
@@ -97,7 +97,7 @@ JUDGE_MODELS = [
     },
     {
         "name": "Mistral-Small",
-        "model_id": "mistralai/mistral-small-creative",
+        "model_id": "mistralai/mistral-small-3.2-24b-instruct",
         "provider": "openrouter",
         "api_base": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
@@ -116,7 +116,7 @@ MODEL_PRICING = {
     "google/gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00},
     "qwen/qwen3.5-122b-a10b": {"input": 0.26, "output": 2.08},
     "z-ai/glm-5": {"input": 0.80, "output": 2.56},
-    "mistralai/mistral-small-creative": {"input": 0.10, "output": 0.30},
+    "mistralai/mistral-small-3.2-24b-instruct": {"input": 0.20, "output": 0.60},
 }
 
 
