@@ -3,11 +3,13 @@ Configuration file for Multi-Agent BI Report System
 Centralizes all configurable parameters.
 """
 
+import random
+
 # =============================================================================
 # MODEL CONFIGURATION
 # =============================================================================
 
-# Default model for report generation via OpenRouter
+# Default model for report generation (Base model before random allocation)
 MODEL_NAME = "openai/gpt-5.4"
 
 # Temperature setting for LLM (0 = deterministic)
@@ -96,14 +98,54 @@ JUDGE_MODELS = [
         "structured_output": False,
     },
     {
-        "name": "Mistral-Small",
-        "model_id": "mistralai/mistral-small-3.2-24b-instruct",
+        "name": "Mistral-Large-3",
+        "model_id": "mistralai/mistral-large-2512",
         "provider": "openrouter",
         "api_base": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
         "structured_output": False,
     },
 ]
+
+# Pool for Random Model Allocation (Agentic Experiment)
+# Using 2026-specific models as defined in config
+MODEL_POOL = [
+    "openai/gpt-5.4",
+    "google/gemini-3.1-pro-preview",
+    "qwen/qwen3.5-122b-a10b",
+    "z-ai/glm-5",
+    "mistralai/mistral-large-2512"
+]
+
+# Manager-specific pool: Qwen excluded because its Thinking Mode is incompatible
+# with LangChain's with_structured_output() (tool_choice="required" is rejected).
+# Workers can still be Qwen — only Manager requires strict JSON structured output.
+MANAGER_POOL = [
+    "openai/gpt-5.4",
+    "google/gemini-3.1-pro-preview",
+    "z-ai/glm-5",
+    "mistralai/mistral-large-2512"
+]
+
+
+def select_models_for_run() -> dict[str, str]:
+    """
+    Randomly assign a model from the appropriate pool to each agent role.
+    
+    - Workers (Researcher, Analyst, Writer, Critic): drawn from full MODEL_POOL
+    - Manager: drawn from MANAGER_POOL (Qwen excluded — Thinking Mode incompatibility)
+    
+    Called once per product run to ensure diversity of intelligence
+    across experiments (random with replacement).
+    
+    Returns:
+        dict mapping role name to model_id, e.g.:
+        {"Researcher": "openai/gpt-5.4", "Analyst": "z-ai/glm-5", ...}
+    """
+    worker_roles = ["Researcher", "Analyst", "Writer", "Critic"]
+    result = {role: random.choice(MODEL_POOL) for role in worker_roles}
+    result["Manager"] = random.choice(MANAGER_POOL)
+    return result
 
 # =============================================================================
 # MODEL PRICING (OpenRouter, per 1M tokens, as of March 2026)
@@ -116,7 +158,7 @@ MODEL_PRICING = {
     "google/gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00},
     "qwen/qwen3.5-122b-a10b": {"input": 0.26, "output": 2.08},
     "z-ai/glm-5": {"input": 0.80, "output": 2.56},
-    "mistralai/mistral-small-3.2-24b-instruct": {"input": 0.20, "output": 0.60},
+    "mistralai/mistral-large-2512": {"input": 0.50, "output": 1.50},
 }
 
 

@@ -6,7 +6,7 @@ Redesigned based on supervisor feedback and reference paper
 ("The Wade Test" — Choudhury, Vanneste & Zohrehvand, 2025):
 
 Key changes from v1:
-  - Each quality/utility sub-dimension is evaluated SEPARATELY
+  - Each writing clarity/utility sub-dimension is evaluated SEPARATELY
   - Chain-of-Thought: qualitative reasoning FIRST, then quantitative score
   - Multi-model judging: runs across 3-4 LLM models for inter-rater reliability
   - Inter-rater reliability metrics (Krippendorff's alpha)
@@ -87,7 +87,7 @@ class MetricResult:
 @dataclass
 class EvaluationResultV2:
     """Complete evaluation result with all metrics, dimensions, and models."""
-    quality: MetricResult = field(default_factory=lambda: MetricResult(metric_name="quality"))
+    quality: MetricResult = field(default_factory=lambda: MetricResult(metric_name="writing_clarity"))
     utility: MetricResult = field(default_factory=lambda: MetricResult(metric_name="utility"))
     accuracy_score: float = 0.0
     accuracy_reasoning: str = ""
@@ -153,12 +153,12 @@ class EvaluationResultV2:
 
 
 # =============================================================================
-# DIMENSION-SEPARATED PROMPTS — QUALITY
+# DIMENSION-SEPARATED PROMPTS — WRITING CLARITY
 # =============================================================================
 # Each dimension is evaluated independently with its own prompt.
 # Chain-of-thought: qualitative analysis FIRST, then score.
 
-QUALITY_DIMENSIONS = prompts.EVAL_QUALITY_DIMENSIONS
+WRITING_CLARITY_DIMENSIONS = prompts.EVAL_QUALITY_DIMENSIONS
 
 # =============================================================================
 # DIMENSION-SEPARATED PROMPTS — UTILITY
@@ -428,6 +428,9 @@ Remember: analyze first, score second. Your score must be justified by your anal
                     judge_llm = llm.with_structured_output(DimensionJudgment)
                     result = judge_llm.invoke(messages)
                     latency = time.time() - start_time
+
+                    if result is None:
+                        raise ValueError(f"Judge {model_config['name']} returned None for structured output")
 
                     return DimensionResult(
                         dimension=dimension_key,
@@ -734,7 +737,7 @@ def save_cot_analyses(
     
     # Quality dimensions
     lines.append(f"")
-    lines.append(f"## Quality")
+    lines.append(f"## Writing Clarity")
     for dim_key, dim_results in result.quality.dimensions.items():
         dim_name = dim_key.replace('_', ' ').title()
         lines.append(f"")
@@ -784,7 +787,7 @@ def save_cot_analyses(
     lines.append(f"")
     lines.append(f"| Metric | Mean Score | Krippendorff α | Cronbach α |")
     lines.append(f"|---|---|---|---|")
-    lines.append(f"| Quality | {result.quality.mean_score}/5.0 | {result.quality.inter_rater_alpha} | {result.quality.inter_rater_cronbach} |")
+    lines.append(f"| Writing Clarity | {result.quality.mean_score}/5.0 | {result.quality.inter_rater_alpha} | {result.quality.inter_rater_cronbach} |")
     lines.append(f"| Utility | {result.utility.mean_score}/5.0 | {result.utility.inter_rater_alpha} | {result.utility.inter_rater_cronbach} |")
     lines.append(f"| Accuracy | {result.accuracy_score}/5.0 | — |")
     lines.append(f"| **Final** | **{result.final_score}/5.0** | — |")
@@ -850,11 +853,11 @@ def evaluate_report_v2(
         print(f"  Available models: {[m['name'] for m in available_models]}")
 
     # ─────────────────────────────────────
-    # 1. QUALITY (LLM Judges — 4 dimensions)
+    # 1. WRITING CLARITY (LLM Judges — 3 dimensions)
     # ─────────────────────────────────────
     result.quality = _evaluate_metric(
-        "quality",
-        QUALITY_DIMENSIONS,
+        "writing_clarity",
+        WRITING_CLARITY_DIMENSIONS,
         report_text,
         product_metadata,
         available_models,
@@ -911,7 +914,7 @@ def evaluate_report_v2(
         print("\n" + "=" * 60)
         print("  FINAL AGGREGATED RESULTS")
         print("=" * 60)
-        print(f"   Quality:  {result.quality.mean_score}/5.0 (Krippendorff α={result.quality.inter_rater_alpha}, Cronbach α={result.quality.inter_rater_cronbach})")
+        print(f"   Writing Clarity:  {result.quality.mean_score}/5.0 (Krippendorff α={result.quality.inter_rater_alpha}, Cronbach α={result.quality.inter_rater_cronbach})")
         print(f"   Utility:  {result.utility.mean_score}/5.0 (Krippendorff α={result.utility.inter_rater_alpha}, Cronbach α={result.utility.inter_rater_cronbach})")
         print(f"   Accuracy: {result.accuracy_score}/5.0 (Deterministic)")
         print(f"\n   ⭐ FINAL SCORE: {result.final_score}/5.0")

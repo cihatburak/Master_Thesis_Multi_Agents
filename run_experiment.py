@@ -24,8 +24,10 @@ import random
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ from flat_graph import run_flat_graph
 from hierarchical_graph import run_hierarchical_graph
 from evaluate import evaluate_report_v2, JUDGE_MODELS
 from efficiency_tracker import EfficiencyTracker
-from config import calculate_cost, MODEL_NAME
+from config import calculate_cost, MODEL_NAME, MODEL_POOL
 from tools import get_product_specs
 
 # =============================================================================
@@ -63,7 +65,7 @@ EXPERIMENT_MODELS = [m for m in [
     _find_model("Gemini-3.1-Pro"),
     _find_model("Qwen-3.5-122B"),
     _find_model("GLM-5"),
-    _find_model("Mistral-Small"),
+    _find_model("Mistral-Large-3"),
 ] if m is not None]
 
 # Architectures: Flat (control) vs. Hierarchical (treatment)
@@ -163,7 +165,7 @@ def run_single(
     )
 
     if verbose:
-        print(f"      ⚖️  Evaluated: Quality={evaluation.quality.mean_score} "
+        print(f"      ⚖️  Evaluated: WritingClarity={evaluation.quality.mean_score} "
               f"Accuracy={evaluation.accuracy_score} "
               f"Utility={evaluation.utility.mean_score} "
               f"→ Final={evaluation.final_score}")
@@ -194,6 +196,7 @@ def run_single(
             "architecture": architecture,
             "timestamp": datetime.now().isoformat(),
             "judge_models": [m["name"] for m in models],
+            "role_assignments": metrics.get("role_assignments", {}),
         },
         "efficiency": {
             "total_tokens": gen_metrics.total_tokens,
@@ -238,7 +241,7 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
     md += "> **Treatment variable**: Manager loop-back authority (present in Hierarchical only)\n\n"
     md += "---\n\n"
     md += "## Table 1: Overall Score Comparison (Mean across all products)\n\n"
-    md += "| Architecture | Quality | Accuracy | Utility | **Final** | Cost | Latency | Tokens |\n"
+    md += "| Architecture | Writing Clarity | Accuracy | Utility | **Final** | Cost | Latency | Tokens |\n"
     md += "|---|---|---|---|---|---|---|---|\n"
 
     for arch_name in ARCHITECTURES:
@@ -372,7 +375,7 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
 
     # ── Per-Product Detail ──
     md += "\n---\n\n## Per-Product Scores\n\n"
-    md += "| ASIN | Architecture | Quality | Accuracy | Utility | Final |\n"
+    md += "| ASIN | Architecture | Writing Clarity | Accuracy | Utility | Final |\n"
     md += "|---|---|---|---|---|---|\n"
     for r in sorted(results, key=lambda x: (x["metadata"]["product_asin"], x["metadata"]["architecture"])):
         asin = r["metadata"]["product_asin"]
@@ -382,6 +385,20 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
         u = r["evaluation"]["utility"]["mean_score"]
         f = r["evaluation"]["final_score"]
         md += f"| {asin} | {arch.title()} | {q:.2f} | {a:.2f} | {u:.2f} | {f:.2f} |\n"
+
+    # ── Table 6: Model Combinations (Random Allocation) ──
+    md += "\n---\n\n## Table 6: Model Allocation per Run\n\n"
+    md += "| ASIN | Architecture | Researcher | Analyst | Writer | Critic | Manager |\n"
+    md += "|---|---|---|---|---|---|---|\n"
+    for r in sorted(results, key=lambda x: (x["metadata"]["product_asin"], x["metadata"]["architecture"])):
+        asin = r["metadata"]["product_asin"]
+        arch = r["metadata"]["architecture"]
+        ra = r["metadata"].get("role_assignments", {})
+        def _short(model_id):
+            return model_id.split("/")[-1] if model_id else "—"
+        md += (f"| {asin} | {arch.title()} | {_short(ra.get('Researcher', ''))} | "
+               f"{_short(ra.get('Analyst', ''))} | {_short(ra.get('Writer', ''))} | "
+               f"{_short(ra.get('Critic', ''))} | {_short(ra.get('Manager', ''))} |\n")
 
     return md
 
@@ -478,7 +495,7 @@ def run_experiment(
 
     # ── 5. Run Experiment ──
     print(f"\n{'='*70}")
-    print("  STARTING EXPERIMENT")
+    print("  STARTING EXPERIMENT (Flat & Hierarchical run in parallel per product)")
     print(f"{'='*70}\n")
 
     total_runs = len(selected) * len(architectures)
@@ -486,6 +503,31 @@ def run_experiment(
     total_cost = 0.0
     errors = []
     start_time = time.time()
+    print_lock = Lock()   # thread-safe console output
+
+    def _run_arch(asin: str, arch: str, run_index: int) -> Optional[dict]:
+        """Worker function executed in a thread for one architecture."""
+        run_key = f"{asin}_{arch}"
+        if run_key in completed:
+            with print_lock:
+                print(f"   ⏭️  {arch.title():15s} — already completed, skipping")
+            return None
+
+        with print_lock:
+            print(f"   🔄 {arch.title():15s} — running... ", flush=True)
+
+        result = run_single(
+            asin, arch, models,
+            experiment_dir=experiment_dir,
+            verbose=False,
+        )
+
+        # Save immediately (checkpoint)
+        result_path = experiment_dir / f"eval_{asin}_{arch}.json"
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        return result
 
     for i, product in enumerate(selected, 1):
         asin = product["asin"]
@@ -494,52 +536,46 @@ def run_experiment(
         print(f"  {product['title'][:65]}")
         print(f"{'─'*70}")
 
-        for arch in architectures:
-            current_run += 1
-            run_key = f"{asin}_{arch}"
+        # Run both architectures concurrently for this product
+        arch_futures = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for arch in architectures:
+                current_run += 1
+                future = executor.submit(_run_arch, asin, arch, current_run)
+                arch_futures[future] = arch
 
-            if run_key in completed:
-                print(f"   ⏭️  {arch.title():15s} — already completed, skipping")
-                continue
+            for future in as_completed(arch_futures):
+                arch = arch_futures[future]
+                try:
+                    result = future.result()
+                    if result is None:
+                        continue   # was skipped (already completed)
 
-            print(f"   🔄 {arch.title():15s} — running... ", end="", flush=True)
+                    run_cost = result["efficiency"]["total_cost_usd"]
+                    total_cost += run_cost
+                    latency = result["efficiency"]["latency_seconds"]
+                    final = result["evaluation"]["final_score"]
 
-            try:
-                result = run_single(
-                    asin, arch, models,
-                    experiment_dir=experiment_dir,
-                    verbose=False,
-                )
+                    elapsed = time.time() - start_time
+                    remaining_runs = total_runs - current_run
+                    est_remaining = (elapsed / max(current_run, 1)) * remaining_runs
 
-                # Save immediately (checkpoint)
-                result_path = experiment_dir / f"eval_{asin}_{arch}.json"
-                with open(result_path, "w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
+                    with print_lock:
+                        print(f"   ✅ {arch.title():15s} Final={final:.2f} | "
+                              f"${run_cost:.4f} | {latency:.0f}s "
+                              f"| [{current_run}/{total_runs}] ~{est_remaining/60:.0f}min left")
 
-                run_cost = result["efficiency"]["total_cost_usd"]
-                total_cost += run_cost
-                latency = result["efficiency"]["latency_seconds"]
-                final = result["evaluation"]["final_score"]
+                except KeyboardInterrupt:
+                    with print_lock:
+                        print(f"\n\n⚠️  Interrupted by user at product {i}/{len(selected)}")
+                        print(f"   Resume with: python run_experiment.py --resume {experiment_dir}")
+                    sys.exit(0)
 
-                elapsed = time.time() - start_time
-                remaining_runs = total_runs - current_run
-                est_remaining = (elapsed / max(current_run, 1)) * remaining_runs
-
-                print(f"✅ Final={final:.2f} | ${run_cost:.4f} | {latency:.0f}s "
-                      f"| [{current_run}/{total_runs}] ~{est_remaining/60:.0f}min left")
-
-                time.sleep(API_DELAY)
-
-            except KeyboardInterrupt:
-                print(f"\n\n⚠️  Interrupted by user at run {current_run}/{total_runs}")
-                print(f"   Resume with: python run_experiment.py --resume {experiment_dir}")
-                sys.exit(0)
-
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                errors.append({"asin": asin, "architecture": arch, "error": str(e)})
-                traceback.print_exc()
-                continue
+                except Exception as e:
+                    with print_lock:
+                        print(f"   ❌ {arch.title()} Error: {e}")
+                    errors.append({"asin": asin, "architecture": arch, "error": str(e)})
+                    traceback.print_exc()
 
     # ── 6. Generate Summary ──
     elapsed_total = time.time() - start_time
@@ -582,6 +618,8 @@ def run_experiment(
             "results": all_results,
         }, f, indent=2, ensure_ascii=False)
     print(f"   ✅ Saved: {summary_json_path}")
+
+
 
     print(f"\n{summary_md}")
 

@@ -13,6 +13,9 @@ This is the CONTROL condition — the only difference from the Hierarchical
 5 Agents: Manager (peer) + Researcher + Analyst + Writer + Critic
 Coordination: Shared Blackboard (symmetric influence, zero hierarchy)
 Flow: Manager → R → Manager → A → Manager → W → Manager → C → Manager → END
+
+Random Model Allocation: Each agent role is assigned a random model from
+MODEL_POOL per run to ensure generalizability (diversity of intelligence).
 """
 
 import os
@@ -56,44 +59,17 @@ class AgentState(TypedDict):
 
 
 # =============================================================================
-# LLM INITIALIZATION (via OpenRouter)
+# LLM FACTORY — Creates model instance for a given model_id
 # =============================================================================
 
-llm = ChatOpenAI(
-    model=config.MODEL_NAME,
-    temperature=config.TEMPERATURE,
-    openai_api_key=os.getenv(config.OPENROUTER_API_KEY_ENV_NAME),
-    openai_api_base=config.OPENROUTER_API_BASE,
-)
-
-
-# =============================================================================
-# AGENT INITIALIZATION
-# =============================================================================
-
-researcher_agent = create_react_agent(
-    llm,
-    tools=[get_product_specs, search_reviews],
-    prompt=prompts.RESEARCHER_PROMPT
-)
-
-analyst_agent = create_react_agent(
-    llm,
-    tools=[],  # Works with data already on the blackboard
-    prompt=prompts.ANALYST_PROMPT
-)
-
-writer_agent = create_react_agent(
-    llm,
-    tools=[],  # Works with analysis already on the blackboard
-    prompt=prompts.WRITER_PROMPT
-)
-
-critic_agent = create_react_agent(
-    llm,
-    tools=[verify_claim],
-    prompt=prompts.CRITIC_PROMPT
-)
+def _create_llm(model_id: str) -> ChatOpenAI:
+    """Create a ChatOpenAI instance for the given OpenRouter model_id."""
+    return ChatOpenAI(
+        model=model_id,
+        temperature=config.TEMPERATURE,
+        openai_api_key=os.getenv(config.OPENROUTER_API_KEY_ENV_NAME),
+        openai_api_base=config.OPENROUTER_API_BASE,
+    )
 
 
 # =============================================================================
@@ -109,82 +85,94 @@ def _get_last_ai_message(messages: list[BaseMessage]) -> str:
     return ""
 
 
-def researcher_node(state: AgentState) -> dict:
-    """Execute the Researcher agent."""
-    input_message = f"User Request: {state['messages'][0].content}\n\nCurrent Blackboard:\n{state.get('blackboard', '')}"
-    
-    # Manager may have provided non-authoritative commentary
-    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
-        input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
+def _make_researcher_node(agent):
+    """Create a researcher node closure with the given agent."""
+    def researcher_node(state: AgentState) -> dict:
+        """Execute the Researcher agent."""
+        input_message = f"User Request: {state['messages'][0].content}\n\nCurrent Blackboard:\n{state.get('blackboard', '')}"
+        
+        # Manager may have provided non-authoritative commentary
+        if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+            input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
 
-    result = researcher_agent.invoke({"messages": [HumanMessage(content=input_message)]})
-    new_insight = _get_last_ai_message(result["messages"])
-    
-    # Append findings to the shared blackboard
-    updated_blackboard = state.get("blackboard", "") + f"\n\n--- RESEARCHER FINDINGS ---\n{new_insight}"
-    
-    return {
-        "messages": result["messages"], 
-        "blackboard": updated_blackboard,
-        "step_count": state.get("step_count", 0) + 1
-    }
-
-
-def analyst_node(state: AgentState) -> dict:
-    """Execute the Analyst agent."""
-    input_message = f"Here is the current Shared Blackboard. Analyze the research:\n{state.get('blackboard', '')}"
-    
-    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
-        input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
-
-    result = analyst_agent.invoke({"messages": [HumanMessage(content=input_message)]})
-    new_insight = _get_last_ai_message(result["messages"])
-    
-    updated_blackboard = state.get("blackboard", "") + f"\n\n--- ANALYST INSIGHTS ---\n{new_insight}"
-    
-    return {
-        "messages": result["messages"], 
-        "blackboard": updated_blackboard,
-        "step_count": state.get("step_count", 0) + 1
-    }
+        result = agent.invoke({"messages": [HumanMessage(content=input_message)]})
+        new_insight = _get_last_ai_message(result["messages"])
+        
+        # Append findings to the shared blackboard
+        updated_blackboard = state.get("blackboard", "") + f"\n\n--- RESEARCHER FINDINGS ---\n{new_insight}"
+        
+        return {
+            "messages": result["messages"], 
+            "blackboard": updated_blackboard,
+            "step_count": state.get("step_count", 0) + 1
+        }
+    return researcher_node
 
 
-def writer_node(state: AgentState) -> dict:
-    """Execute the Writer agent."""
-    input_message = f"Here is the current Shared Blackboard. Write the BI Report based on this:\n{state.get('blackboard', '')}"
-    
-    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
-        input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
+def _make_analyst_node(agent):
+    """Create an analyst node closure with the given agent."""
+    def analyst_node(state: AgentState) -> dict:
+        """Execute the Analyst agent."""
+        input_message = f"Here is the current Shared Blackboard. Analyze the research:\n{state.get('blackboard', '')}"
+        
+        if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+            input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
 
-    result = writer_agent.invoke({"messages": [HumanMessage(content=input_message)]})
-    new_insight = _get_last_ai_message(result["messages"])
-    
-    updated_blackboard = state.get("blackboard", "") + f"\n\n--- DRAFT REPORT (WRITER) ---\n{new_insight}"
-    
-    return {
-        "messages": result["messages"], 
-        "blackboard": updated_blackboard,
-        "step_count": state.get("step_count", 0) + 1
-    }
+        result = agent.invoke({"messages": [HumanMessage(content=input_message)]})
+        new_insight = _get_last_ai_message(result["messages"])
+        
+        updated_blackboard = state.get("blackboard", "") + f"\n\n--- ANALYST INSIGHTS ---\n{new_insight}"
+        
+        return {
+            "messages": result["messages"], 
+            "blackboard": updated_blackboard,
+            "step_count": state.get("step_count", 0) + 1
+        }
+    return analyst_node
 
 
-def critic_node(state: AgentState) -> dict:
-    """Execute the Critic agent."""
-    input_message = f"Here is the current Shared Blackboard. Review the Draft Report and verify findings:\n{state.get('blackboard', '')}"
-    
-    if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
-        input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
+def _make_writer_node(agent):
+    """Create a writer node closure with the given agent."""
+    def writer_node(state: AgentState) -> dict:
+        """Execute the Writer agent."""
+        input_message = f"Here is the current Shared Blackboard. Write the BI Report based on this:\n{state.get('blackboard', '')}"
+        
+        if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+            input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
 
-    result = critic_agent.invoke({"messages": [HumanMessage(content=input_message)]})
-    new_insight = _get_last_ai_message(result["messages"])
-    
-    updated_blackboard = state.get("blackboard", "") + f"\n\n--- CRITIC REVIEW ---\n{new_insight}"
-    
-    return {
-        "messages": result["messages"], 
-        "blackboard": updated_blackboard,
-        "step_count": state.get("step_count", 0) + 1
-    }
+        result = agent.invoke({"messages": [HumanMessage(content=input_message)]})
+        new_insight = _get_last_ai_message(result["messages"])
+        
+        updated_blackboard = state.get("blackboard", "") + f"\n\n--- DRAFT REPORT (WRITER) ---\n{new_insight}"
+        
+        return {
+            "messages": result["messages"], 
+            "blackboard": updated_blackboard,
+            "step_count": state.get("step_count", 0) + 1
+        }
+    return writer_node
+
+
+def _make_critic_node(agent):
+    """Create a critic node closure with the given agent."""
+    def critic_node(state: AgentState) -> dict:
+        """Execute the Critic agent."""
+        input_message = f"Here is the current Shared Blackboard. Review the Draft Report and verify findings:\n{state.get('blackboard', '')}"
+        
+        if state.get("instructions") and state.get("instructions") != "Proceeding forward.":
+            input_message += f"\n\n[MANAGER COMMENTARY (for reference only)]:\n{state['instructions']}"
+
+        result = agent.invoke({"messages": [HumanMessage(content=input_message)]})
+        new_insight = _get_last_ai_message(result["messages"])
+        
+        updated_blackboard = state.get("blackboard", "") + f"\n\n--- CRITIC REVIEW ---\n{new_insight}"
+        
+        return {
+            "messages": result["messages"], 
+            "blackboard": updated_blackboard,
+            "step_count": state.get("step_count", 0) + 1
+        }
+    return critic_node
 
 
 # =============================================================================
@@ -202,69 +190,83 @@ class ManagerDecision(BaseModel):
 FLAT_WORKER_SEQUENCE = ["Researcher", "Analyst", "Writer", "Critic", "FINISH"]
 
 
-def flat_manager_node(state: AgentState) -> dict:
-    """
-    Manager node (Flat / Symmetric) — reviews worker output on the Blackboard
-    and provides commentary, but ALWAYS proceeds to the next worker in sequence.
-    
-    This is the CONTROL version: the Manager has the same observational
-    capabilities as in the Hierarchical architecture, but ZERO loop-back
-    authority. The routing is deterministically forced forward.
-    """
-    step_count = state.get("step_count", 0) + 1
-    blackboard = state.get("blackboard", "")
+def _make_flat_manager_node(manager_llm):
+    """Create a flat manager node closure with the given LLM."""
+    def flat_manager_node(state: AgentState) -> dict:
+        """
+        Manager node (Flat / Symmetric) — reviews worker output on the Blackboard
+        and provides commentary, but ALWAYS proceeds to the next worker in sequence.
+        
+        This is the CONTROL version: the Manager has the same observational
+        capabilities as in the Hierarchical architecture, but ZERO loop-back
+        authority. The routing is deterministically forced forward.
+        """
+        step_count = state.get("step_count", 0) + 1
+        blackboard = state.get("blackboard", "")
 
-    # Determine which workers have already contributed via Blackboard tags
-    workers_done = []
-    if "--- RESEARCHER FINDINGS ---" in blackboard:
-        workers_done.append("Researcher")
-    if "--- ANALYST INSIGHTS ---" in blackboard:
-        workers_done.append("Analyst")
-    if "--- DRAFT REPORT (WRITER) ---" in blackboard:
-        workers_done.append("Writer")
-    if "--- CRITIC REVIEW ---" in blackboard:
-        workers_done.append("Critic")
+        # Determine which workers have already contributed via Blackboard tags
+        workers_done = []
+        if "--- RESEARCHER FINDINGS ---" in blackboard:
+            workers_done.append("Researcher")
+        if "--- ANALYST INSIGHTS ---" in blackboard:
+            workers_done.append("Analyst")
+        if "--- DRAFT REPORT (WRITER) ---" in blackboard:
+            workers_done.append("Writer")
+        if "--- CRITIC REVIEW ---" in blackboard:
+            workers_done.append("Critic")
 
-    # Determine the next worker in the fixed sequence
-    next_worker = "FINISH"
-    for worker in FLAT_WORKER_SEQUENCE:
-        if worker not in workers_done and worker != "FINISH":
-            next_worker = worker
-            break
-    else:
+        # Determine the next worker in the fixed sequence
         next_worker = "FINISH"
+        for worker in FLAT_WORKER_SEQUENCE:
+            if worker not in workers_done and worker != "FINISH":
+                next_worker = worker
+                break
+        else:
+            next_worker = "FINISH"
 
-    # Manager still reads the Blackboard and provides commentary (symmetric influence)
-    # This ensures the Manager LLM call happens, matching token usage patterns
-    manager_llm = llm.with_structured_output(ManagerDecision)
+        # Manager still reads the Blackboard and provides commentary (symmetric influence)
+        # This ensures the Manager LLM call happens, matching token usage patterns
+        structured_llm = manager_llm.with_structured_output(ManagerDecision)
 
-    formatted_prompt = prompts.FLAT_MANAGER_PROMPT.format(
-        step_count=step_count,
-    )
+        formatted_prompt = prompts.FLAT_MANAGER_PROMPT.format(
+            step_count=step_count,
+        )
 
-    messages = [
-        SystemMessage(content=formatted_prompt),
-        HumanMessage(
-            content=f"Step {step_count}. Review the latest Shared Blackboard and provide "
-                    f"your observations. You MUST proceed to: {next_worker}.\n\n"
-                    f"CURRENT BLACKBOARD:\n{blackboard}"
-        ),
-    ]
+        messages = [
+            SystemMessage(content=formatted_prompt),
+            HumanMessage(
+                content=f"Step {step_count}. Review the latest Shared Blackboard and provide "
+                        f"your observations. You MUST proceed to: {next_worker}.\n\n"
+                        f"CURRENT BLACKBOARD:\n{blackboard}"
+            ),
+        ]
 
-    result = manager_llm.invoke(messages)
+        try:
+            result = structured_llm.invoke(messages)
+            # Also catch empty/invalid results that slip past without raising
+            if result is None or not hasattr(result, 'next_worker'):
+                raise ValueError("Model returned None or invalid structured output")
+        except Exception:
+            # Fallback: safe default that proceeds the pipeline forward
+            result = ManagerDecision(
+                next_worker=next_worker,
+                instructions="Proceeding forward (fallback).",
+                reasoning="Model failed to provide structured output; using system fallback."
+            )
 
-    # Append Manager's commentary to the Blackboard (symmetric — all agents can read it)
-    commentary = result.reasoning if result.reasoning else "No additional observations."
-    updated_blackboard = blackboard + f"\n\n--- MANAGER COMMENT ---\n{commentary}"
+        # Append Manager's commentary to the Blackboard (symmetric — all agents can read it)
+        commentary = result.reasoning if result.reasoning else "No additional observations."
+        updated_blackboard = blackboard + f"\n\n--- MANAGER COMMENT ---\n{commentary}"
 
-    # FORCE the next worker to be the deterministic one (override any LLM suggestion)
-    return {
-        "next": next_worker,
-        "instructions": result.instructions if result.instructions else "Proceeding forward.",
-        "blackboard": updated_blackboard,
-        "step_count": step_count,
-        "loop_count": 0,  # Always 0 in flat — no loop-backs
-    }
+        # FORCE the next worker to be the deterministic one (override any LLM suggestion)
+        return {
+            "next": next_worker,
+            "instructions": result.instructions if result.instructions else "Proceeding forward.",
+            "blackboard": updated_blackboard,
+            "step_count": step_count,
+            "loop_count": 0,  # Always 0 in flat — no loop-backs
+        }
+    return flat_manager_node
 
 
 # =============================================================================
@@ -283,7 +285,7 @@ def route_from_manager(state: AgentState) -> str:
 # GRAPH CONSTRUCTION — MANAGER-INTERLEAVED PIPELINE
 # =============================================================================
 
-def build_flat_graph() -> StateGraph:
+def build_flat_graph(role_assignments: dict[str, str]) -> StateGraph:
     """
     Build the flat agent graph with Manager-interleaved sequencing.
     
@@ -292,15 +294,47 @@ def build_flat_graph() -> StateGraph:
     Manager → R → Manager → A → Manager → W → Manager → C → Manager → END
     
     Treatment variable: Manager's loop-back authority is ABSENT here.
+    
+    Args:
+        role_assignments: dict mapping role name to model_id
     """
+    # Create LLM instances per role
+    researcher_llm = _create_llm(role_assignments["Researcher"])
+    analyst_llm = _create_llm(role_assignments["Analyst"])
+    writer_llm = _create_llm(role_assignments["Writer"])
+    critic_llm = _create_llm(role_assignments["Critic"])
+    manager_llm = _create_llm(role_assignments["Manager"])
+
+    # Create agents with role-specific LLMs
+    researcher_agent = create_react_agent(
+        researcher_llm,
+        tools=[get_product_specs, search_reviews],
+        messages_modifier=prompts.RESEARCHER_PROMPT
+    )
+    analyst_agent = create_react_agent(
+        analyst_llm,
+        tools=[],
+        messages_modifier=prompts.ANALYST_PROMPT
+    )
+    writer_agent = create_react_agent(
+        writer_llm,
+        tools=[],
+        messages_modifier=prompts.WRITER_PROMPT
+    )
+    critic_agent = create_react_agent(
+        critic_llm,
+        tools=[verify_claim],
+        messages_modifier=prompts.CRITIC_PROMPT
+    )
+
     workflow = StateGraph(AgentState)
 
     # Add nodes — same workers as Hierarchical + Manager (peer role)
-    workflow.add_node("Manager", flat_manager_node)
-    workflow.add_node("Researcher", researcher_node)
-    workflow.add_node("Analyst", analyst_node)
-    workflow.add_node("Writer", writer_node)
-    workflow.add_node("Critic", critic_node)
+    workflow.add_node("Manager", _make_flat_manager_node(manager_llm))
+    workflow.add_node("Researcher", _make_researcher_node(researcher_agent))
+    workflow.add_node("Analyst", _make_analyst_node(analyst_agent))
+    workflow.add_node("Writer", _make_writer_node(writer_agent))
+    workflow.add_node("Critic", _make_critic_node(critic_agent))
 
     # Entry point: Manager observes and routes to first worker
     workflow.set_entry_point("Manager")
@@ -333,7 +367,11 @@ def build_flat_graph() -> StateGraph:
 
 def run_flat_graph(query: str, session_id: str = "session") -> tuple[str, list, dict]:
     """Run the flat graph and return the final report, messages, and metrics."""
-    graph = build_flat_graph()
+    # Random model allocation per run
+    role_assignments = config.select_models_for_run()
+    print(f"   🎲 Flat Model Assignments: { {k: v.split('/')[-1] for k, v in role_assignments.items()} }")
+
+    graph = build_flat_graph(role_assignments)
 
     initial_state = {
         "messages": [HumanMessage(content=query)],
@@ -359,6 +397,7 @@ def run_flat_graph(query: str, session_id: str = "session") -> tuple[str, list, 
             "step_count": final_state.get("step_count", 0),
             "loop_count": final_state.get("loop_count", 0),
             "architecture": "flat",
+            "role_assignments": role_assignments,
         }
 
     # Save logs (Now includes Blackboard)
@@ -399,6 +438,7 @@ if __name__ == "__main__":
     print("=" * 70)
     print("FLAT AGENT ARCHITECTURE — Shared Blackboard & Manager (No Authority)")
     print("Manager → R → Manager → A → Manager → W → Manager → C → Manager → END")
+    print("Random Model Allocation: ENABLED")
     print("=" * 70)
 
     # Using a dummy ASIN that exists in the dataset for testing
@@ -424,3 +464,4 @@ if __name__ == "__main__":
     print(f"Total Cost: ${metrics['total_cost']:.4f}")
     print(f"Step Count: {metrics['step_count']}")
     print(f"Loop Count: {metrics['loop_count']}")
+    print(f"Role Assignments: {metrics['role_assignments']}")

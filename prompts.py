@@ -156,14 +156,15 @@ Current step: {step_count}
 Review the Blackboard and proceed to the next worker."""
 
 # =============================================================================
-# 3. EVALUATION PROMPTS (Strict Rubrics for high Cronbach's Alpha)
+# 3. EVALUATION PROMPTS — WRITING CLARITY (Strict Rubrics for high Cronbach's Alpha)
 # =============================================================================
 # Updated to ensure deterministic scoring among different LLM judges.
+# Note: Variable name kept as EVAL_QUALITY_DIMENSIONS for backward compatibility.
 
 EVAL_QUALITY_DIMENSIONS = {
     "structure": {
         "name": "Structure",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
+        "prompt": """You are a Senior Editor evaluating the Writing Clarity of a Business Intelligence report.
 Evaluate ONLY the STRUCTURE dimension.
 
 EVALUATION PROTOCOL:
@@ -179,7 +180,7 @@ STRICT SCORING RUBRIC:
     },
     "coherence": {
         "name": "Coherence",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
+        "prompt": """You are a Senior Editor evaluating the Writing Clarity of a Business Intelligence report.
 Evaluate ONLY the COHERENCE dimension.
 
 EVALUATION PROTOCOL:
@@ -195,7 +196,7 @@ STRICT SCORING RUBRIC:
     },
     "conciseness": {
         "name": "Conciseness",
-        "prompt": """You are a Senior Editor evaluating a Business Intelligence report.
+        "prompt": """You are a Senior Editor evaluating the Writing Clarity of a Business Intelligence report.
 Evaluate ONLY the CONCISENESS dimension.
 
 EVALUATION PROTOCOL:
