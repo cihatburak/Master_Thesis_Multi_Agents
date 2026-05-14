@@ -18,6 +18,7 @@ thesis/
 *.md
 *.txt
 !requirements.txt
+!README.md
 
 # Databases and Big Data
 chroma_db/

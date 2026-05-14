@@ -1,28 +1,22 @@
-"""
-Evaluation Engine v2 — Dimension-Separated, Chain-of-Thought, Multi-Model
-Multi-Agent BI Report System
+"""Multi-model judge panel for Writing Clarity, Utility, and (script-based) Accuracy.
 
-Redesigned based on supervisor feedback and reference paper
-("The Wade Test" — Choudhury, Vanneste & Zohrehvand, 2025):
+Each rubric dimension is scored independently by every available judge model
+using a chain-of-thought protocol (qualitative analysis first, then numeric
+score). Inter-rater reliability is reported via Krippendorff's and Cronbach's
+alpha. Accuracy is computed deterministically against ground-truth specs.
 
-Key changes from v1:
-  - Each writing clarity/utility sub-dimension is evaluated SEPARATELY
-  - Chain-of-Thought: qualitative reasoning FIRST, then quantitative score
-  - Multi-model judging: runs across 3-4 LLM models for inter-rater reliability
-  - Inter-rater reliability metrics (Krippendorff's alpha)
-  - Efficiency metrics tracking (tokens, cost, latency)
-  - Accuracy (script-based) remains unchanged
+Protocol follows Choudhury, Vanneste & Zohrehvand (2025).
 """
 
 import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Prevent tokenizers fork deadlock with ThreadPoolExecutor
+# Avoid HuggingFace tokenizers deadlocking under ThreadPoolExecutor.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from dotenv import load_dotenv
@@ -33,18 +27,12 @@ from pydantic import BaseModel, Field
 import config
 import prompts
 
+
 load_dotenv()
 
-# =============================================================================
-# CONFIGURATION — MULTI-MODEL SETUP
-# =============================================================================
 
-# Judge models are now centralized in config.py
 JUDGE_MODELS = config.JUDGE_MODELS
 
-# =============================================================================
-# PYDANTIC SCHEMAS
-# =============================================================================
 
 class DimensionJudgment(BaseModel):
     """Chain-of-thought judgment for a single evaluation dimension."""
@@ -73,10 +61,8 @@ class DimensionResult:
 
 @dataclass
 class MetricResult:
-    """Aggregated result for a metric (quality/utility) across all dimensions and models."""
     metric_name: str
     dimensions: dict[str, list[DimensionResult]] = field(default_factory=dict)
-    # Aggregated scores
     mean_score: float = 0.0
     per_model_scores: dict[str, float] = field(default_factory=dict)
     per_dimension_scores: dict[str, float] = field(default_factory=dict)
@@ -86,20 +72,16 @@ class MetricResult:
 
 @dataclass
 class EvaluationResultV2:
-    """Complete evaluation result with all metrics, dimensions, and models."""
     quality: MetricResult = field(default_factory=lambda: MetricResult(metric_name="writing_clarity"))
     utility: MetricResult = field(default_factory=lambda: MetricResult(metric_name="utility"))
     accuracy_score: float = 0.0
     accuracy_reasoning: str = ""
-    # Efficiency
     total_eval_tokens: int = 0
     total_eval_cost_usd: float = 0.0
     total_eval_latency_seconds: float = 0.0
-    # Final
     final_score: float = 0.0
 
     def to_dict(self) -> dict:
-        """Convert to serializable dict for JSON export."""
         return {
             "quality": {
                 "mean_score": self.quality.mean_score,
@@ -152,24 +134,9 @@ class EvaluationResultV2:
         }
 
 
-# =============================================================================
-# DIMENSION-SEPARATED PROMPTS — WRITING CLARITY
-# =============================================================================
-# Each dimension is evaluated independently with its own prompt.
-# Chain-of-thought: qualitative analysis FIRST, then score.
-
 WRITING_CLARITY_DIMENSIONS = prompts.EVAL_QUALITY_DIMENSIONS
-
-# =============================================================================
-# DIMENSION-SEPARATED PROMPTS — UTILITY
-# =============================================================================
-
 UTILITY_DIMENSIONS = prompts.EVAL_UTILITY_DIMENSIONS
 
-
-# =============================================================================
-# SCRIPT-BASED ACCURACY (unchanged from v1)
-# =============================================================================
 
 def load_ground_truth(asin: str, dataset_path: str = "dataset_final.json") -> Optional[dict]:
     """Load ground truth metadata for a given ASIN from the dataset."""
@@ -186,7 +153,6 @@ def load_ground_truth(asin: str, dataset_path: str = "dataset_final.json") -> Op
 
 
 def extract_specs_from_text(text: str) -> dict:
-    """Extract technical specifications from text using regex patterns."""
     specs = {}
 
     gpu_patterns = [
@@ -242,12 +208,11 @@ def extract_specs_from_text(text: str) -> dict:
 
 
 def normalize_spec(spec: str) -> str:
-    """Normalize a spec string for comparison."""
     return re.sub(r'[\s\-_]+', '', spec.lower())
 
 
 def compare_spec(key: str, report_val: str, gt_val: str) -> bool:
-    """Semantic comparison per spec category."""
+    """Semantic comparison per spec category (handles RAM/GPU/CPU/storage forms)."""
     report_lower = report_val.lower()
     gt_lower = gt_val.lower()
 
@@ -293,7 +258,7 @@ def calculate_script_accuracy(
     gt_specs = extract_specs_from_text(gt_text)
 
     if verbose:
-        print(f"\n📊 Script-Based Accuracy Check")
+        print(f"\nScript-based accuracy check")
         print(f"   Report specs: {report_specs}")
         print(f"   Ground truth specs: {gt_specs}")
 
@@ -326,16 +291,12 @@ def calculate_script_accuracy(
     return round(score, 2), reasoning
 
 
-# =============================================================================
-# LLM JUDGE — DIMENSION-LEVEL EVALUATION
-# =============================================================================
-
 def _get_llm_client(model_config: dict) -> ChatOpenAI:
-    """Create an LLM client based on model configuration."""
     kwargs = {
         "model": model_config["model_id"],
         "temperature": 0,
-        "request_timeout": 120,  # Increased from 60 to handle slow judge models (Qwen/GLM)
+        # 120s rather than 60s: Qwen/GLM judges occasionally exceed the shorter timeout.
+        "request_timeout": 120,
     }
 
     if model_config["provider"] == "openrouter":
@@ -356,23 +317,18 @@ def _get_llm_client(model_config: dict) -> ChatOpenAI:
 
 
 def _parse_json_fallback(text: str) -> dict:
-    """Extract JSON from LLM response text, handling markdown code fences."""
+    """Extract a judgment dict from a free-text LLM response, tolerating code fences."""
     def _clean_and_parse(raw: str) -> dict:
-        """Remove invalid control characters before parsing JSON."""
-        # Remove control chars (0x00-0x1F) except valid JSON whitespace (\t, \n, \r)
+        # Strip non-whitespace control chars before parsing; some judges emit them.
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
-        # Also fix unescaped newlines/tabs INSIDE JSON string values
         return json.loads(cleaned, strict=False)
 
-    # Try to find JSON in code fences first
     json_match = re.search(r'```(?:json)?\s*\n?(\{.*?\})\s*```', text, re.DOTALL)
     if json_match:
         return _clean_and_parse(json_match.group(1))
-    # Try to parse the whole text as JSON
     json_match = re.search(r'\{[^{}]*"qualitative_analysis"[^{}]*"score"[^{}]*\}', text, re.DOTALL)
     if json_match:
         return _clean_and_parse(json_match.group(0))
-    # Last resort: find any JSON object
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     if json_match:
         return _clean_and_parse(json_match.group(0))
@@ -386,13 +342,10 @@ def _evaluate_single_dimension(
     report_text: str,
     product_metadata: str,
 ) -> DimensionResult:
-    """
-    Evaluate a single dimension with a single model.
-    Following the reference paper protocol:
-      1. Qualitative analysis first (chain-of-thought reasoning)
-      2. Then quantitative score based on the analysis
+    """Score one dimension with one judge: qualitative analysis first, then a numeric score.
 
-    Uses structured output when available, falls back to JSON parsing otherwise.
+    Uses native structured output when the model supports it, falls back to
+    free-text JSON parsing otherwise. Retries with backoff on transient errors.
     """
     start_time = time.time()
 
@@ -423,7 +376,6 @@ Remember: analyze first, score second. Your score must be justified by your anal
             use_structured = model_config.get("structured_output", True)
 
             if use_structured:
-                # ── Path A: Structured output (native support) ──
                 try:
                     judge_llm = llm.with_structured_output(DimensionJudgment)
                     result = judge_llm.invoke(messages)
@@ -441,14 +393,12 @@ Remember: analyze first, score second. Your score must be justified by your anal
                     )
 
                 except Exception as structured_err:
-                    # If structured failed, fall back to JSON but check if it's a timeout
+                    # Re-raise on timeout so the retry loop can back off; otherwise
+                    # silently fall through to the free-text JSON fallback path.
                     if "timeout" in str(structured_err).lower() and attempt < max_retries - 1:
-                        raise structured_err # Trigger retry
-                    
-                    print(f"   ↩️  {model_config['name']}: structured output failed, using JSON fallback")
-                    # Fall through to JSON mode below
+                        raise structured_err
+                    print(f"   {model_config['name']}: structured output failed, using JSON fallback")
 
-            # ── Path B: JSON-mode (direct or fallback) ──
             json_instruction = (
                 "\n\nRESPOND ONLY with a JSON object in this exact format:\n"
                 '{"qualitative_analysis": "<your detailed analysis>", "score": <number 1.0-5.0>}'
@@ -463,7 +413,7 @@ Remember: analyze first, score second. Your score must be justified by your anal
             latency = time.time() - start_time
 
             score = float(parsed.get("score", 3.0))
-            score = max(1.0, min(5.0, score))  # clamp to valid range
+            score = max(1.0, min(5.0, score))
 
             return DimensionResult(
                 dimension=dimension_key,
@@ -475,37 +425,24 @@ Remember: analyze first, score second. Your score must be justified by your anal
 
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"   🔄  Retry {attempt+1}/{max_retries} for {dimension_key}/{model_config['name']} due to: {str(e)[:50]}...")
+                print(f"   Retry {attempt+1}/{max_retries} for {dimension_key}/{model_config['name']} due to: {str(e)[:50]}...")
                 time.sleep(retry_delay * (attempt + 1))
                 continue
-            
+
             latency = time.time() - start_time
-            print(f"   ⚠️  Final Error evaluating {dimension_config['name']} with {model_config['name']}: {e}")
+            print(f"   Final error evaluating {dimension_config['name']} with {model_config['name']}: {e}")
+            # Neutral fallback so the run still produces a complete matrix.
             return DimensionResult(
                 dimension=dimension_key,
                 model_name=model_config["name"],
                 qualitative_analysis=f"ERROR: {str(e)}",
-                score=3.0,  # neutral fallback
+                score=3.0,
                 latency_seconds=round(latency, 2),
             )
 
 
-# =============================================================================
-# INTER-RATER RELIABILITY
-# =============================================================================
-
 def calculate_krippendorff_alpha(scores_matrix: list[list[float]]) -> float:
-    """
-    Calculate Krippendorff's alpha for inter-rater reliability.
-
-    Args:
-        scores_matrix: List of lists where each inner list contains scores
-                       from different raters for the same item.
-                       Shape: [n_items x n_raters]
-
-    Returns:
-        Alpha value between -1 and 1. >0.8 is good, >0.67 is acceptable.
-    """
+    """Krippendorff's alpha (interval-level) for an [n_items x n_raters] score matrix."""
     if not scores_matrix or len(scores_matrix) < 2:
         return 0.0
 
@@ -562,19 +499,7 @@ def calculate_krippendorff_alpha(scores_matrix: list[list[float]]) -> float:
 
 
 def calculate_cronbachs_alpha(scores_matrix: list[list[float]]) -> float:
-    """
-    Calculate Cronbach's alpha for internal consistency.
-
-    Measures whether raters RANK items consistently, regardless of
-    absolute score differences. More tolerant than Krippendorff's alpha.
-
-    Args:
-        scores_matrix: [n_items x n_raters] — each row is an item,
-                       each column is a rater's score.
-
-    Returns:
-        Alpha value. >0.8 = excellent, >0.7 = acceptable, >0.6 = questionable.
-    """
+    """Cronbach's alpha for the same matrix; tolerant to absolute-score differences."""
     if not scores_matrix or len(scores_matrix) < 2:
         return 0.0
 
@@ -583,25 +508,23 @@ def calculate_cronbachs_alpha(scores_matrix: list[list[float]]) -> float:
     if n_raters < 2:
         return 0.0
 
-    # Filter out columns (raters) that have None values
+    # Drop any rater (column) with missing values so all raters score every item.
     valid_cols = []
     for col_idx in range(n_raters):
         col = [scores_matrix[row_idx][col_idx] for row_idx in range(n_items)]
         if all(v is not None for v in col):
             valid_cols.append(col)
 
-    k = len(valid_cols)  # number of valid raters
+    k = len(valid_cols)
     if k < 2:
         return 0.0
 
-    # Calculate variance of each rater's scores
     rater_variances = []
     for col in valid_cols:
         mean = sum(col) / len(col)
         var = sum((x - mean) ** 2 for x in col) / len(col)
         rater_variances.append(var)
 
-    # Calculate variance of total scores (sum across raters for each item)
     totals = [sum(valid_cols[c][i] for c in range(k)) for i in range(n_items)]
     total_mean = sum(totals) / len(totals)
     total_var = sum((t - total_mean) ** 2 for t in totals) / len(totals)
@@ -615,10 +538,6 @@ def calculate_cronbachs_alpha(scores_matrix: list[list[float]]) -> float:
     return round(alpha, 4)
 
 
-# =============================================================================
-# METRIC-LEVEL EVALUATION (Quality / Utility)
-# =============================================================================
-
 def _evaluate_metric(
     metric_name: str,
     dimensions: dict,
@@ -627,10 +546,7 @@ def _evaluate_metric(
     models: list[dict],
     verbose: bool = True,
 ) -> MetricResult:
-    """
-    Evaluate all dimensions of a metric across all models.
-    Each dimension is evaluated separately by each model.
-    """
+    """Score every (dimension x model) cell in parallel and aggregate."""
     result = MetricResult(metric_name=metric_name)
 
     if verbose:
@@ -640,7 +556,6 @@ def _evaluate_metric(
         print(f"  Models: {', '.join(m['name'] for m in models)}")
         print(f"{'='*60}")
 
-    # Run all dimension×model combinations
     tasks = []
     with ThreadPoolExecutor(max_workers=config.EVAL_MAX_WORKERS) as executor:
         for dim_key, dim_config in dimensions.items():
@@ -658,12 +573,11 @@ def _evaluate_metric(
                 dim_result = future.result(timeout=config.EVAL_TIMEOUT)
                 result.dimensions[dim_key].append(dim_result)
                 if verbose:
-                    print(f"   ✅ {dim_result.dimension}/{dim_result.model_name}: "
+                    print(f"   {dim_result.dimension}/{dim_result.model_name}: "
                           f"{dim_result.score}/5.0 ({dim_result.latency_seconds}s)")
             except Exception as e:
-                print(f"   ❌ {dim_key}/{model_name}: {e}")
+                print(f"   FAIL {dim_key}/{model_name}: {e}")
 
-    # Aggregate per-model scores (average across dimensions)
     model_scores: dict[str, list[float]] = {}
     for dim_key, dim_results in result.dimensions.items():
         for dr in dim_results:
@@ -672,17 +586,14 @@ def _evaluate_metric(
     for model_name, scores in model_scores.items():
         result.per_model_scores[model_name] = round(sum(scores) / len(scores), 2)
 
-    # Aggregate per-dimension scores (average across models)
     for dim_key, dim_results in result.dimensions.items():
         scores = [dr.score for dr in dim_results]
         result.per_dimension_scores[dim_key] = round(sum(scores) / len(scores), 2) if scores else 0.0
 
-    # Overall mean score
     all_scores = [dr.score for dim_results in result.dimensions.values() for dr in dim_results]
     result.mean_score = round(sum(all_scores) / len(all_scores), 2) if all_scores else 0.0
 
-    # Inter-rater reliability (Krippendorff's alpha)
-    # Build matrix: rows = dimensions, columns = models (raters)
+    # Inter-rater matrix: rows = dimensions, columns = models (raters).
     model_names = [m["name"] for m in models]
     scores_matrix = []
     for dim_key in dimensions:
@@ -697,33 +608,22 @@ def _evaluate_metric(
     result.inter_rater_cronbach = calculate_cronbachs_alpha(scores_matrix)
 
     if verbose:
-        print(f"\n   📊 {metric_name.upper()} SUMMARY:")
-        print(f"   Mean Score: {result.mean_score}/5.0")
-        print(f"   Per-Model: {result.per_model_scores}")
-        print(f"   Per-Dimension: {result.per_dimension_scores}")
-        print(f"   Krippendorff's α: {result.inter_rater_alpha}")
-        print(f"   Cronbach's α:     {result.inter_rater_cronbach}")
+        print(f"\n   {metric_name.upper()} SUMMARY:")
+        print(f"   Mean score:      {result.mean_score}/5.0")
+        print(f"   Per-model:       {result.per_model_scores}")
+        print(f"   Per-dimension:   {result.per_dimension_scores}")
+        print(f"   Krippendorff a:  {result.inter_rater_alpha}")
+        print(f"   Cronbach a:      {result.inter_rater_cronbach}")
 
     return result
 
-
-# =============================================================================
-# COT ANALYSIS PERSISTENCE
-# =============================================================================
 
 def save_cot_analyses(
     result: "EvaluationResultV2",
     output_dir: str,
     run_id: str,
 ) -> str:
-    """
-    Save all qualitative (Chain-of-Thought) analyses to a readable markdown file.
-    
-    Creates a file at {output_dir}/cot_{run_id}.md with all judge analyses
-    organized by metric > dimension > model for easy inspection.
-    
-    Returns the path to the saved file.
-    """
+    """Dump every judge's qualitative analysis to a readable markdown file."""
     from pathlib import Path
     
     out_path = Path(output_dir) / f"cot_{run_id}.md"
@@ -744,7 +644,7 @@ def save_cot_analyses(
         lines.append(f"### {dim_name}")
         for dr in dim_results:
             lines.append(f"")
-            lines.append(f"#### 🤖 {dr.model_name} — Score: {dr.score}/5.0")
+            lines.append(f"#### {dr.model_name} - Score: {dr.score}/5.0")
             lines.append(f"")
             lines.append(f"{dr.qualitative_analysis}")
             lines.append(f"")
@@ -762,7 +662,7 @@ def save_cot_analyses(
         lines.append(f"### {dim_name}")
         for dr in dim_results:
             lines.append(f"")
-            lines.append(f"#### 🤖 {dr.model_name} — Score: {dr.score}/5.0")
+            lines.append(f"#### {dr.model_name} - Score: {dr.score}/5.0")
             lines.append(f"")
             lines.append(f"{dr.qualitative_analysis}")
             lines.append(f"")
@@ -796,10 +696,6 @@ def save_cot_analyses(
     return str(out_path)
 
 
-# =============================================================================
-# MAIN EVALUATION FUNCTION
-# =============================================================================
-
 def evaluate_report_v2(
     report_text: str,
     product_metadata: str,
@@ -809,35 +705,18 @@ def evaluate_report_v2(
     output_dir: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> EvaluationResultV2:
-    """
-    Evaluate a BI report using the v2 evaluation engine.
-
-    Protocol (based on Choudhury, Vanneste & Zohrehvand, 2025):
-      1. Quality: 4 dimensions evaluated separately, CoT, multi-model
-      2. Utility: 3 dimensions evaluated separately, CoT, multi-model
-      3. Accuracy: deterministic script-based (unchanged)
-
-    Args:
-        report_text: The generated BI report to evaluate
-        product_metadata: Product specifications string
-        asin: Product ASIN for ground truth lookup
-        models: List of model configs to use (defaults to JUDGE_MODELS)
-        verbose: Whether to print detailed results
-
-    Returns:
-        EvaluationResultV2 with all metrics, dimensions, and cross-model results
-    """
+    """Evaluate a single BI report. Returns an EvaluationResultV2 with all judge cells."""
     if models is None:
         models = JUDGE_MODELS
 
-    # Filter models to only those with available API keys
+    # Skip judges whose API key is not set so the panel still runs partial.
     available_models = []
     for m in models:
         key = os.getenv(m["api_key_env"])
         if key:
             available_models.append(m)
         elif verbose:
-            print(f"   ⚠️  Skipping {m['name']} — {m['api_key_env']} not set")
+            print(f"   Skipping {m['name']} - {m['api_key_env']} not set")
 
     if not available_models:
         raise ValueError("No models available. Set at least OPENAI_API_KEY.")
@@ -847,14 +726,10 @@ def evaluate_report_v2(
 
     if verbose:
         print("\n" + "=" * 60)
-        print("  EVALUATION ENGINE v2")
-        print("  Dimension-Separated | Chain-of-Thought | Multi-Model")
+        print("  Judge panel evaluation")
         print("=" * 60)
         print(f"  Available models: {[m['name'] for m in available_models]}")
 
-    # ─────────────────────────────────────
-    # 1. WRITING CLARITY (LLM Judges — 3 dimensions)
-    # ─────────────────────────────────────
     result.quality = _evaluate_metric(
         "writing_clarity",
         WRITING_CLARITY_DIMENSIONS,
@@ -864,9 +739,6 @@ def evaluate_report_v2(
         verbose,
     )
 
-    # ─────────────────────────────────────
-    # 2. UTILITY (LLM Judges — 3 dimensions)
-    # ─────────────────────────────────────
     result.utility = _evaluate_metric(
         "utility",
         UTILITY_DIMENSIONS,
@@ -876,12 +748,9 @@ def evaluate_report_v2(
         verbose,
     )
 
-    # ─────────────────────────────────────
-    # 3. ACCURACY (Script-Based)
-    # ─────────────────────────────────────
     if verbose:
         print(f"\n{'='*60}")
-        print("  ACCURACY (Deterministic)")
+        print("  Accuracy (deterministic)")
         print(f"{'='*60}")
 
     ground_truth = None
@@ -902,9 +771,6 @@ def evaluate_report_v2(
         print(f"   Score: {result.accuracy_score}/5.0")
         print(f"   Reasoning: {result.accuracy_reasoning}")
 
-    # ─────────────────────────────────────
-    # AGGREGATE
-    # ─────────────────────────────────────
     result.total_eval_latency_seconds = round(time.time() - eval_start, 2)
     result.final_score = round(
         (result.quality.mean_score + result.utility.mean_score + result.accuracy_score) / 3, 2
@@ -912,72 +778,26 @@ def evaluate_report_v2(
 
     if verbose:
         print("\n" + "=" * 60)
-        print("  FINAL AGGREGATED RESULTS")
+        print("  Final aggregated results")
         print("=" * 60)
-        print(f"   Writing Clarity:  {result.quality.mean_score}/5.0 (Krippendorff α={result.quality.inter_rater_alpha}, Cronbach α={result.quality.inter_rater_cronbach})")
-        print(f"   Utility:  {result.utility.mean_score}/5.0 (Krippendorff α={result.utility.inter_rater_alpha}, Cronbach α={result.utility.inter_rater_cronbach})")
-        print(f"   Accuracy: {result.accuracy_score}/5.0 (Deterministic)")
-        print(f"\n   ⭐ FINAL SCORE: {result.final_score}/5.0")
-        print(f"   ⏱  Total Latency: {result.total_eval_latency_seconds}s")
+        print(f"   Writing Clarity:  {result.quality.mean_score}/5.0 (Krippendorff a={result.quality.inter_rater_alpha}, Cronbach a={result.quality.inter_rater_cronbach})")
+        print(f"   Utility:          {result.utility.mean_score}/5.0 (Krippendorff a={result.utility.inter_rater_alpha}, Cronbach a={result.utility.inter_rater_cronbach})")
+        print(f"   Accuracy:         {result.accuracy_score}/5.0 (deterministic)")
+        print(f"\n   FINAL SCORE: {result.final_score}/5.0")
+        print(f"   Total latency: {result.total_eval_latency_seconds}s")
         print("=" * 60)
 
-    # Save CoT analyses to file if output_dir is provided
     if output_dir and run_id:
         try:
             cot_path = save_cot_analyses(result, output_dir, run_id)
             if verbose:
-                print(f"   📝 CoT analyses saved: {cot_path}")
+                print(f"   CoT analyses saved: {cot_path}")
         except Exception as e:
             if verbose:
-                print(f"   ⚠️  Failed to save CoT analyses: {e}")
+                print(f"   Failed to save CoT analyses: {e}")
 
     return result
 
-
-# =============================================================================
-# BACKWARD COMPATIBILITY — simple interface matching v1
-# =============================================================================
-
-def evaluate_report(
-    report_text: str,
-    product_metadata: str,
-    asin: Optional[str] = None,
-    verbose: bool = True,
-) -> dict:
-    """
-    Backward-compatible wrapper. Returns a dict matching v1 EvaluationResult fields.
-    Uses only the first available model for speed (single-model mode).
-    """
-    # Use only GPT-4o for backward compatibility
-    single_model = [JUDGE_MODELS[0]]
-
-    result = evaluate_report_v2(
-        report_text, product_metadata, asin,
-        models=single_model, verbose=verbose,
-    )
-
-    return {
-        "quality_score": result.quality.mean_score,
-        "quality_reasoning": "; ".join(
-            dr.qualitative_analysis[:100]
-            for dim_results in result.quality.dimensions.values()
-            for dr in dim_results
-        ),
-        "accuracy_score": result.accuracy_score,
-        "accuracy_reasoning": result.accuracy_reasoning,
-        "utility_score": result.utility.mean_score,
-        "utility_reasoning": "; ".join(
-            dr.qualitative_analysis[:100]
-            for dim_results in result.utility.dimensions.values()
-            for dr in dim_results
-        ),
-        "final_score": result.final_score,
-    }
-
-
-# =============================================================================
-# EXECUTION
-# =============================================================================
 
 if __name__ == "__main__":
     DUMMY_METADATA = """
@@ -1021,15 +841,10 @@ While the MSI Katana offers strong gaming performance, the recurring BSOD issues
 impact the user experience and brand reputation. Immediate action is recommended.
 """
 
-    print("=" * 60)
-    print("  EVALUATION ENGINE v2 — TEST RUN")
-    print("=" * 60)
-    print("\n📄 Testing with dummy report and metadata...")
-    print("   (Only models with available API keys will be used)\n")
+    print("Evaluation engine standalone test")
+    print("Only models with available API keys will be used.\n")
 
     result = evaluate_report_v2(DUMMY_REPORT, DUMMY_METADATA, asin="B0CXVGSY2H")
 
-    print("\n\n" + "=" * 60)
-    print("  FULL RESULT (JSON)")
-    print("=" * 60)
+    print("\n\nFull result (JSON):\n")
     print(json.dumps(result.to_dict(), indent=2))

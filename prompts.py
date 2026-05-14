@@ -1,16 +1,10 @@
-"""
-Centralized Prompts Module
+"""System prompts for worker agents, the Manager, and the evaluation judge panel.
 
-Stores all system prompts for Agents (Specialists/Manager) and Evaluation Judges.
-Updated to enforce the "Shared Blackboard" architecture and strict evaluation rubrics.
+All inter-agent communication is mediated by a shared Blackboard pattern:
+agents read accumulated state and append their contribution rather than
+addressing each other directly.
 """
 
-# =============================================================================
-# 1. SPECIALIST AGENT PROMPTS (Shared Blackboard Logic)
-# =============================================================================
-# In the new architecture, agents do not directly pass messages to one another.
-# They are instructed to read the current state of a Shared Blackboard, perform
-# their specialized task, and append their findings back to the Blackboard.
 
 SHARED_BLACKBOARD_DIRECTIVE = """
 You are part of a 5-agent team collaborating on a Business Intelligence report.
@@ -91,11 +85,7 @@ If the report is perfect, confirm with "APPROVED: [brief summary of quality]".
 If issues are found, list them clearly for the record.
 """
 
-# =============================================================================
-# 2. MANAGER PROMPT (Asymmetric Influence / Authoritative Routing)
-# =============================================================================
-# Only used in Hierarchical Graph. The Manager has authority to force Loop-Backs.
-
+# Hierarchical Manager: asymmetric influence, may force loop-backs.
 MANAGER_PROMPT = """You coordinate a BI report generation team of 4 workers:
 - Researcher: Gathers product specs and customer reviews
 - Analyst: Analyzes gathered data to find patterns and insights
@@ -126,12 +116,7 @@ DECISION GUIDE:
 Current step: {step_count}
 Analyze the Blackboard conversation and decide the next step."""
 
-# =============================================================================
-# 2b. FLAT MANAGER PROMPT (Symmetric Influence / No Authority)
-# =============================================================================
-# Used in Flat Graph. Same Manager persona, but with ZERO loop-back authority.
-# The Manager participates as a peer: observes, comments, but cannot reject.
-
+# Flat Manager: peer participant, no authority to reject or loop back.
 FLAT_MANAGER_PROMPT = """You coordinate a BI report generation team of 4 workers:
 - Researcher: Gathers product specs and customer reviews
 - Analyst: Analyzes gathered data to find patterns and insights
@@ -155,12 +140,8 @@ then ALWAYS move to the next worker in sequence. You cannot loop back.
 Current step: {step_count}
 Review the Blackboard and proceed to the next worker."""
 
-# =============================================================================
-# 3. EVALUATION PROMPTS — WRITING CLARITY (Strict Rubrics for high Cronbach's Alpha)
-# =============================================================================
-# Updated to ensure deterministic scoring among different LLM judges.
-# Note: Variable name kept as EVAL_QUALITY_DIMENSIONS for backward compatibility.
-
+# Judge-panel rubrics. Variable name kept for backward compatibility — these
+# correspond to Writing Clarity (structure/coherence/conciseness).
 EVAL_QUALITY_DIMENSIONS = {
     "structure": {
         "name": "Structure",

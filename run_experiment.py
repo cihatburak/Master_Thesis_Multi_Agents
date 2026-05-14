@@ -1,21 +1,17 @@
-"""
-Experiment Runner — Flat vs. Hierarchical Architecture Comparison
-Multi-Agent BI Report System — Master's Thesis
+"""Main experiment driver: Flat vs. Hierarchical across N products.
 
-Runs Flat and Hierarchical architectures across N products,
-evaluates each report with evaluate_v2, and generates thesis-ready summary tables.
-
-Experimental Design:
-  - Control (Flat): Manager-interleaved pipeline, Manager has NO loop-back authority
-  - Treatment (Hierarchical): Same workers + Manager WITH loop-back authority
-  - Treatment variable: Manager's loop-back authority (only difference)
+For every product, both architectures are run in parallel with the same
+per-role model assignment (paired design), each generated report is
+scored by the judge panel, and per-run JSONs are checkpointed under
+results/experiments/exp_<timestamp>/. A summary table is written at the
+end. The treatment variable is the Manager's loop-back authority.
 
 Usage:
     python run_experiment.py                      # 15 random products
     python run_experiment.py --n 5                # 5 random products
     python run_experiment.py --arch flat          # only flat
     python run_experiment.py --dry-run            # show plan, don't run
-    python run_experiment.py --resume EXP_DIR     # resume interrupted experiment
+    python run_experiment.py --resume EXP_DIR     # resume an earlier run
 """
 
 import argparse
@@ -34,27 +30,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Local imports
 from flat_graph import run_flat_graph
 from hierarchical_graph import run_hierarchical_graph
 from evaluate import evaluate_report_v2, JUDGE_MODELS
 from efficiency_tracker import EfficiencyTracker
-from config import calculate_cost, MODEL_NAME, MODEL_POOL
+from config import calculate_cost, MODEL_NAME, MODEL_POOL, select_models_for_run
 from tools import get_product_specs
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
-# Default number of products to sample
 DEFAULT_N_PRODUCTS = 15
+MIN_REVIEWS = 5
 
-# Minimum reviews required (0-review products are excluded)
-MIN_REVIEWS = 1
 
-# Judge models for evaluation
 def _find_model(name):
-    """Find a model by name from JUDGE_MODELS."""
     for m in JUDGE_MODELS:
         if m["name"] == name:
             return m
@@ -68,22 +56,14 @@ EXPERIMENT_MODELS = [m for m in [
     _find_model("Mistral-Large-3"),
 ] if m is not None]
 
-# Architectures: Flat (control) vs. Hierarchical (treatment)
-ARCHITECTURES = [
-    "flat",
-    "hierarchical",
-]
+ARCHITECTURES = ["flat", "hierarchical"]
 
-# Delay between API calls (seconds) - Set to 0 for maximum speed with 2026 models
+# Inter-call sleep; left at 0 because the 2026 OpenRouter pool tolerates concurrency.
 API_DELAY = 0
 
 
-# =============================================================================
-# PRODUCT LOADING
-# =============================================================================
-
 def load_products(dataset_path: str = "dataset_final.json") -> list[dict]:
-    """Load products from dataset, filtering out those with < MIN_REVIEWS."""
+    """Load products from dataset, filtering out those with fewer than MIN_REVIEWS."""
     with open(dataset_path, 'r') as f:
         data = json.load(f)
 
@@ -101,7 +81,6 @@ def load_products(dataset_path: str = "dataset_final.json") -> list[dict]:
 
 
 def select_products(products: list[dict], n: int, seed: Optional[int] = None) -> list[dict]:
-    """Randomly select n products. Use seed for reproducibility."""
     if seed is not None:
         random.seed(seed)
     if n >= len(products):
@@ -109,20 +88,18 @@ def select_products(products: list[dict], n: int, seed: Optional[int] = None) ->
     return random.sample(products, n)
 
 
-# =============================================================================
-# SINGLE RUN
-# =============================================================================
-
 def run_single(
     asin: str,
     architecture: str,
     models: list[dict],
+    role_assignments: dict,
     experiment_dir: Optional[Path] = None,
     verbose: bool = True,
 ) -> dict:
-    """
-    Run a single architecture on a single product and evaluate.
-    Returns a complete result dict ready for JSON serialization.
+    """Run one architecture on one product, evaluate, and return a serializable result.
+
+    role_assignments must be identical for Flat and Hierarchical on the same
+    product so the paired design holds (architecture is the only manipulation).
     """
     product_metadata = get_product_specs.invoke({"asin": asin})
     query = (
@@ -130,14 +107,13 @@ def run_single(
         f"covering customer feedback, issues, and recommendations."
     )
 
-    # ── 1. Generate Report ──
-    tracker = EfficiencyTracker(architecture, asin=asin, model="gpt-4o")
+    tracker = EfficiencyTracker(architecture, asin=asin, model="multi-model")
     tracker.start()
 
     if architecture == "flat":
-        report, _, metrics = run_flat_graph(query, session_id=asin)
+        report, _, metrics = run_flat_graph(query, session_id=asin, role_assignments=role_assignments)
     elif architecture == "hierarchical":
-        report, _, metrics = run_hierarchical_graph(query, session_id=asin)
+        report, _, metrics = run_hierarchical_graph(query, session_id=asin, role_assignments=role_assignments)
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -146,13 +122,11 @@ def run_single(
     gen_metrics = tracker.get_metrics()
 
     if verbose:
-        print(f"      📝 Report generated ({gen_metrics.total_tokens:,} tokens, "
+        print(f"      Report generated ({gen_metrics.total_tokens:,} tokens, "
               f"${gen_metrics.total_cost_usd:.4f}, {gen_metrics.latency_seconds:.1f}s)")
 
-    # ── 2. Evaluate Report ──
     time.sleep(API_DELAY)
 
-    # Pass experiment_dir so CoT analyses are saved alongside results
     cot_output_dir = str(experiment_dir) if experiment_dir else None
 
     evaluation = evaluate_report_v2(
@@ -165,22 +139,20 @@ def run_single(
     )
 
     if verbose:
-        print(f"      ⚖️  Evaluated: WritingClarity={evaluation.quality.mean_score} "
+        print(f"      Evaluated: WritingClarity={evaluation.quality.mean_score} "
               f"Accuracy={evaluation.accuracy_score} "
               f"Utility={evaluation.utility.mean_score} "
-              f"→ Final={evaluation.final_score}")
+              f"-> Final={evaluation.final_score}")
 
-    # ── 3. Calculate Cost ──
     gen_cost = calculate_cost(
         MODEL_NAME,
         gen_metrics.prompt_tokens,
         gen_metrics.completion_tokens,
     )
 
-    # Estimate evaluation cost based on empirical data from pilot run
-    # True evaluation cost was ~2.8x higher than initial formula due to lengthy CoT outputs and large prompts
-    n_judges = len(models)
-    n_dimensions = 7  # 4 quality + 3 utility
+    # Per-judge token counts come from a pilot calibration: lengthy CoT outputs
+    # and large prompts pushed the realised cost ~2.8x above an earlier estimate.
+    n_dimensions = 7  # 4 writing-clarity + 3 utility
     eval_cost = 0.0
     for m in models:
         prompt_t = n_dimensions * 3200
@@ -189,7 +161,6 @@ def run_single(
 
     total_cost = round(gen_cost + eval_cost, 6)
 
-    # ── 4. Package Result ──
     return {
         "metadata": {
             "product_asin": asin,
@@ -214,12 +185,8 @@ def run_single(
     }
 
 
-# =============================================================================
-# SUMMARY GENERATION
-# =============================================================================
-
 def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
-    """Read all result JSONs and generate thesis-ready summary tables."""
+    """Read every per-run JSON in experiment_dir and emit a Markdown summary."""
     results = []
     for json_file in sorted(experiment_dir.glob("eval_*.json")):
         with open(json_file) as f:
@@ -228,15 +195,13 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
     if not results:
         return "No results found."
 
-    # Group by architecture
     arch_data: dict[str, list[dict]] = {"flat": [], "hierarchical": []}
     for r in results:
         arch = r["metadata"]["architecture"]
         if arch in arch_data:
             arch_data[arch].append(r)
 
-    # ── Table 1: Overall Score Comparison ──
-    md = "# Experiment Summary — Flat vs. Hierarchical\n\n"
+    md = "# Experiment Summary - Flat vs. Hierarchical\n\n"
     md += f"**Products**: {len(products)} | **Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     md += "> **Treatment variable**: Manager loop-back authority (present in Hierarchical only)\n\n"
     md += "---\n\n"
@@ -258,7 +223,6 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
         md += (f"| {arch_name.title()} | {q:.2f} | {a:.2f} | {u:.2f} | "
                f"**{f_score:.2f}** | ${cost:.4f} | {lat:.1f}s | {tokens:,.0f} |\n")
 
-    # ── Table 2: Per-Dimension Scores ──
     md += "\n---\n\n## Table 2: Per-Dimension Mean Scores\n\n"
     all_dims = [
         "structure", "coherence", "conciseness",
@@ -300,7 +264,6 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
             md += " — |"
     md += "\n"
 
-    # ── Table 3: Per-Model Scores ──
     md += "\n---\n\n## Table 3: Per-Model Mean Scores\n\n"
     all_models = set()
     for r in results:
@@ -329,14 +292,13 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
                 row += " — |"
         md += row + "\n"
 
-    # ── Table 4: Inter-Rater Reliability ──
     md += "\n---\n\n## Table 4: Inter-Rater Reliability\n\n"
     md += "| Metric | " + " | ".join(a.title() for a in ARCHITECTURES) + " |\n"
     md += "|---|" + "|".join("---" for _ in ARCHITECTURES) + "|\n"
 
     for metric in ["quality", "utility"]:
-        # Krippendorff's α
-        row = f"| {metric.title()} Krippendorff α |"
+        display_name = "Writing Clarity" if metric == "quality" else "Utility"
+        row = f"| {display_name} Krippendorff a |"
         for arch_name in ARCHITECTURES:
             data = arch_data.get(arch_name, [])
             if data:
@@ -346,8 +308,7 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
                 row += " — |"
         md += row + "\n"
 
-        # Cronbach's α
-        row = f"| {metric.title()} Cronbach α |"
+        row = f"| {display_name} Cronbach a |"
         for arch_name in ARCHITECTURES:
             data = arch_data.get(arch_name, [])
             if data:
@@ -357,7 +318,6 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
                 row += " — |"
         md += row + "\n"
 
-    # ── Table 5: Efficiency ──
     md += "\n---\n\n## Table 5: Efficiency Trade-off\n\n"
     md += "| Architecture | Tokens (mean) | Cost (mean) | Latency (mean) | Steps (mean) | Loops (mean) |\n"
     md += "|---|---|---|---|---|---|\n"
@@ -373,7 +333,6 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
         loops = sum(r["efficiency"].get("loop_count", 0) for r in data) / len(data)
         md += f"| {arch_name.title()} | {t:,.0f} | ${c:.4f} | {l:.1f}s | {s:.1f} | {loops:.1f} |\n"
 
-    # ── Per-Product Detail ──
     md += "\n---\n\n## Per-Product Scores\n\n"
     md += "| ASIN | Architecture | Writing Clarity | Accuracy | Utility | Final |\n"
     md += "|---|---|---|---|---|---|\n"
@@ -386,7 +345,6 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
         f = r["evaluation"]["final_score"]
         md += f"| {asin} | {arch.title()} | {q:.2f} | {a:.2f} | {u:.2f} | {f:.2f} |\n"
 
-    # ── Table 6: Model Combinations (Random Allocation) ──
     md += "\n---\n\n## Table 6: Model Allocation per Run\n\n"
     md += "| ASIN | Architecture | Researcher | Analyst | Writer | Critic | Manager |\n"
     md += "|---|---|---|---|---|---|---|\n"
@@ -395,17 +353,13 @@ def generate_summary(experiment_dir: Path, products: list[dict]) -> str:
         arch = r["metadata"]["architecture"]
         ra = r["metadata"].get("role_assignments", {})
         def _short(model_id):
-            return model_id.split("/")[-1] if model_id else "—"
+            return model_id.split("/")[-1] if model_id else "-"
         md += (f"| {asin} | {arch.title()} | {_short(ra.get('Researcher', ''))} | "
                f"{_short(ra.get('Analyst', ''))} | {_short(ra.get('Writer', ''))} | "
                f"{_short(ra.get('Critic', ''))} | {_short(ra.get('Manager', ''))} |\n")
 
     return md
 
-
-# =============================================================================
-# MAIN EXPERIMENT LOOP
-# =============================================================================
 
 def run_experiment(
     n_products: int = DEFAULT_N_PRODUCTS,
@@ -416,20 +370,18 @@ def run_experiment(
     dry_run: bool = False,
     resume_dir: Optional[str] = None,
 ):
-    """Run the full experiment."""
     if architectures is None:
         architectures = ARCHITECTURES
     if models is None:
         models = EXPERIMENT_MODELS
 
     print("=" * 70)
-    print("  EXPERIMENT RUNNER — Flat vs. Hierarchical Comparison")
-    print("  Treatment: Manager loop-back authority")
+    print("  Experiment runner: Flat vs. Hierarchical")
+    print("  Treatment variable: Manager loop-back authority")
     print("=" * 70)
 
-    # ── 1. Load & Select Products ──
     all_products = load_products()
-    print(f"\n📦 Total products in dataset: {len(all_products)} (with ≥{MIN_REVIEWS} reviews)")
+    print(f"\nTotal products in dataset: {len(all_products)} (with >={MIN_REVIEWS} reviews)")
 
     if specific_asins:
         selected = [p for p in all_products if p["asin"] in specific_asins]
@@ -440,22 +392,22 @@ def run_experiment(
 
     print(f"\n   Selected products:")
     for i, p in enumerate(selected, 1):
-        print(f"   {i:2d}. {p['asin']} — {p['title'][:55]}... ({p['n_reviews']} reviews)")
+        print(f"   {i:2d}. {p['asin']} - {p['title'][:55]}... ({p['n_reviews']} reviews)")
 
-    # ── 2. Setup Experiment Directory ──
     if resume_dir:
         experiment_dir = Path(resume_dir)
-        print(f"\n📂 Resuming experiment: {experiment_dir}")
+        print(f"\nResuming experiment: {experiment_dir}")
     else:
         exp_id = datetime.now().strftime("exp_%Y%m%d_%H%M%S")
         experiment_dir = Path("results/experiments") / exp_id
         experiment_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n📂 Experiment directory: {experiment_dir}")
+        print(f"\nExperiment directory: {experiment_dir}")
 
-    # Save config
     exp_config = {
         "experiment_type": "flat_vs_hierarchical",
         "treatment_variable": "manager_loop_back_authority",
+        # Same per-role model assignments are reused across both arms per product.
+        "paired_design": True,
         "n_products": len(selected),
         "architectures": architectures,
         "judge_models": [m["name"] for m in models],
@@ -468,18 +420,16 @@ def run_experiment(
     with open(config_path, "w") as f:
         json.dump(exp_config, f, indent=2)
 
-    # ── 3. Estimate Cost ──
     n_runs = len(selected) * len(architectures)
     est_cost = n_runs * 0.28
-    print(f"\n💰 Estimated cost: ~${est_cost:.2f} ({n_runs} runs × ~$0.28/run)")
+    print(f"\nEstimated cost: ~${est_cost:.2f} ({n_runs} runs x ~$0.28/run)")
     print(f"   Models: {[m['name'] for m in models]}")
     print(f"   Architectures: {architectures}")
 
     if dry_run:
-        print("\n🏁 DRY RUN — stopping before execution.")
+        print("\nDry run - stopping before execution.")
         return
 
-    # ── 4. Check for completed runs (resume support) ──
     completed = set()
     for json_file in experiment_dir.glob("eval_*.json"):
         try:
@@ -491,11 +441,10 @@ def run_experiment(
             pass
 
     if completed:
-        print(f"\n♻️  Found {len(completed)} completed runs — skipping those.")
+        print(f"\nFound {len(completed)} completed runs - skipping those.")
 
-    # ── 5. Run Experiment ──
     print(f"\n{'='*70}")
-    print("  STARTING EXPERIMENT (Flat & Hierarchical run in parallel per product)")
+    print("  Starting experiment (Flat & Hierarchical run in parallel per product)")
     print(f"{'='*70}\n")
 
     total_runs = len(selected) * len(architectures)
@@ -503,26 +452,26 @@ def run_experiment(
     total_cost = 0.0
     errors = []
     start_time = time.time()
-    print_lock = Lock()   # thread-safe console output
+    print_lock = Lock()
 
-    def _run_arch(asin: str, arch: str, run_index: int) -> Optional[dict]:
-        """Worker function executed in a thread for one architecture."""
+    def _run_arch(asin: str, arch: str, run_index: int, role_assignments: dict[str, str]) -> Optional[dict]:
         run_key = f"{asin}_{arch}"
         if run_key in completed:
             with print_lock:
-                print(f"   ⏭️  {arch.title():15s} — already completed, skipping")
+                print(f"   {arch.title():15s} - already completed, skipping")
             return None
 
         with print_lock:
-            print(f"   🔄 {arch.title():15s} — running... ", flush=True)
+            print(f"   {arch.title():15s} - running... ", flush=True)
 
         result = run_single(
             asin, arch, models,
+            role_assignments=role_assignments,
             experiment_dir=experiment_dir,
             verbose=False,
         )
 
-        # Save immediately (checkpoint)
+        # Checkpoint immediately so a crash doesn't lose this run.
         result_path = experiment_dir / f"eval_{asin}_{arch}.json"
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
@@ -531,17 +480,22 @@ def run_experiment(
 
     for i, product in enumerate(selected, 1):
         asin = product["asin"]
-        print(f"\n{'─'*70}")
+        print(f"\n{'-'*70}")
         print(f"  [{i}/{len(selected)}] Product: {asin}")
         print(f"  {product['title'][:65]}")
-        print(f"{'─'*70}")
+        print(f"{'-'*70}")
+
+        # One per-role allocation for both arms: architecture is the only treatment variable.
+        product_role_assignments = select_models_for_run()
+        short_names = {k: v.split('/')[-1] for k, v in product_role_assignments.items()}
+        print(f"  Paired model assignment: {short_names}")
 
         # Run both architectures concurrently for this product
         arch_futures = {}
         with ThreadPoolExecutor(max_workers=2) as executor:
             for arch in architectures:
                 current_run += 1
-                future = executor.submit(_run_arch, asin, arch, current_run)
+                future = executor.submit(_run_arch, asin, arch, current_run, product_role_assignments)
                 arch_futures[future] = arch
 
             for future in as_completed(arch_futures):
@@ -549,7 +503,7 @@ def run_experiment(
                 try:
                     result = future.result()
                     if result is None:
-                        continue   # was skipped (already completed)
+                        continue
 
                     run_cost = result["efficiency"]["total_cost_usd"]
                     total_cost += run_cost
@@ -561,26 +515,25 @@ def run_experiment(
                     est_remaining = (elapsed / max(current_run, 1)) * remaining_runs
 
                     with print_lock:
-                        print(f"   ✅ {arch.title():15s} Final={final:.2f} | "
+                        print(f"   {arch.title():15s} Final={final:.2f} | "
                               f"${run_cost:.4f} | {latency:.0f}s "
                               f"| [{current_run}/{total_runs}] ~{est_remaining/60:.0f}min left")
 
                 except KeyboardInterrupt:
                     with print_lock:
-                        print(f"\n\n⚠️  Interrupted by user at product {i}/{len(selected)}")
+                        print(f"\n\nInterrupted by user at product {i}/{len(selected)}")
                         print(f"   Resume with: python run_experiment.py --resume {experiment_dir}")
                     sys.exit(0)
 
                 except Exception as e:
                     with print_lock:
-                        print(f"   ❌ {arch.title()} Error: {e}")
+                        print(f"   {arch.title()} ERROR: {e}")
                     errors.append({"asin": asin, "architecture": arch, "error": str(e)})
                     traceback.print_exc()
 
-    # ── 6. Generate Summary ──
     elapsed_total = time.time() - start_time
     print(f"\n{'='*70}")
-    print("  EXPERIMENT COMPLETE")
+    print("  Experiment complete")
     print(f"{'='*70}")
     print(f"  Total time: {elapsed_total/60:.1f} minutes")
     print(f"  Total cost: ${total_cost:.4f}")
@@ -589,19 +542,19 @@ def run_experiment(
     if errors:
         print(f"\n  Failed runs:")
         for e in errors:
-            print(f"    ❌ {e['asin']} / {e['architecture']}: {e['error'][:80]}")
+            print(f"    {e['asin']} / {e['architecture']}: {e['error'][:80]}")
 
         errors_path = experiment_dir / "errors.json"
         with open(errors_path, "w") as f:
             json.dump(errors, f, indent=2)
 
-    print("\n📊 Generating summary tables...")
+    print("\nGenerating summary tables...")
     summary_md = generate_summary(experiment_dir, selected)
 
     summary_md_path = experiment_dir / "summary.md"
     with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write(summary_md)
-    print(f"   ✅ Saved: {summary_md_path}")
+    print(f"   Saved: {summary_md_path}")
 
     all_results = []
     for json_file in sorted(experiment_dir.glob("eval_*.json")):
@@ -617,16 +570,10 @@ def run_experiment(
             "n_errors": len(errors),
             "results": all_results,
         }, f, indent=2, ensure_ascii=False)
-    print(f"   ✅ Saved: {summary_json_path}")
-
-
+    print(f"   Saved: {summary_json_path}")
 
     print(f"\n{summary_md}")
 
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
