@@ -131,7 +131,6 @@ def figure1_dimension_comparison(flat_data, hier_data):
             bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.8))
 
     ax.set_ylabel("Mean Score (1–5)")
-    ax.set_title("Figure 1. Per-Dimension Score Comparison: Flat vs. Hierarchical Architecture")
     ax.set_xticks(x)
     ax.set_xticklabels([name for name, _ in dimensions])
     ax.set_ylim(3.6, 5.15)
@@ -194,16 +193,17 @@ def figure2_loop_vs_clarity(hier_data):
         ax.text(lc, m + stds[i] + 0.05, f"n={n}\n({m:.2f})", ha="center",
                 va="bottom", fontsize=9, fontweight="bold", color="#333333")
 
-    # OLS regression annotation
+    # OLS regression annotation (full-controls spec matches §4.5.1 in thesis)
     ax.annotate(
-        r"OLS: $\beta$ = −0.134, p < 0.001",
-        xy=(1.5, 4.15), fontsize=10, fontstyle="italic", color="#D32F2F",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFEBEE", edgecolor="#D32F2F", alpha=0.8),
+        r"OLS (full controls): $\beta$ = −0.142, p < 0.001"
+        "\n"
+        r"Drop loop=3:   $\beta$ = −0.074, p = 0.038",
+        xy=(0.65, 3.18), fontsize=9, fontstyle="italic", color="#D32F2F",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFEBEE", edgecolor="#D32F2F", alpha=0.85),
     )
 
     ax.set_xlabel("Number of Manager Loop-Backs")
     ax.set_ylabel("Writing Clarity Score (1–5)")
-    ax.set_title("Figure 2. Effect of Revision Loops on Writing Clarity\n(Hierarchical Architecture Only)")
     ax.set_xticks(loop_counts)
     ax.set_xticklabels([str(lc) for lc in loop_counts])
     ax.set_ylim(3.0, 5.0)
@@ -257,8 +257,6 @@ def figure3_efficiency_comparison(flat_data, hier_data):
     width = 0.35
 
     fig, axes = plt.subplots(1, 4, figsize=(14, 5.5), sharey=False)
-    fig.suptitle("Figure 3. Efficiency Comparison: Flat vs. Hierarchical Architecture",
-                 fontsize=13, y=0.98)
 
     for i, (ax, (label, key, unit)) in enumerate(zip(axes, metrics)):
         bars_f = ax.bar(0, flat_means[i], width=0.6, yerr=flat_stds[i],

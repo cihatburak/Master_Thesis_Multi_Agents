@@ -26,11 +26,10 @@ After generation, each report is scored by a 5-model LLM judge panel on Writing 
 ├── evaluate.py                  # 5-judge LLM panel and accuracy scoring
 ├── run_experiment.py            # Main experiment driver: runs both architectures across all products
 ├── ingest.py                    # Loads dataset_final.json into ChromaDB with sentence-bert embeddings
-├── cleanup_dataset.py           # One-off dataset preparation script
 ├── app.py                       # Streamlit UI for interactive single-product runs
 ├── run_stats.py                 # Paired t-tests, Cohen's d, descriptives
 ├── robustness_check.py          # Wilcoxon signed-rank and Holm-Bonferroni correction
-├── mediation_analysis.py        # Mixed-effects regression for the dose-response analysis
+├── revision_analyses.py         # TOST equivalence, dose-response robustness, inter-judge and inter-dimension correlations
 └── generate_thesis_figures.py   # Matplotlib figures used in the thesis and paper
 ```
 
@@ -67,7 +66,7 @@ The expected workflow is:
 
 2. **Run the experiment.** `python run_experiment.py` walks through every product in the dataset, runs both architectures with the same model assignment per product, evaluates the resulting reports with the judge panel, and writes results to `general_analysis/`. This is the long-running step; on the full 43-product set it takes several hours depending on rate limits.
 
-3. **Run the statistics.** `python run_stats.py` produces the paired t-tests and Cohen's d values reported in the paper. `python robustness_check.py` adds Wilcoxon and Holm-Bonferroni corrections. `python mediation_analysis.py` runs the dose-response mixed-effects regression on the hierarchical arm.
+3. **Run the statistics.** `python run_stats.py` produces the paired t-tests and Cohen's d values reported in the thesis. `python robustness_check.py` adds Wilcoxon and Holm-Bonferroni corrections. `python revision_analyses.py results/experiments/exp_<timestamp>` runs the TOST equivalence test on Structure, the dose-response robustness regressions, and the inter-judge and inter-dimension correlation matrices.
 
 4. **Regenerate figures.** `python generate_thesis_figures.py` produces the matplotlib figures used in the thesis.
 
